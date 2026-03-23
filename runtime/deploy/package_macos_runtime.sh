@@ -12,6 +12,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+rewrite_absolute_symlinks() {
+  local root="$1"
+
+  while IFS= read -r -d '' link_path; do
+    local target
+    target="$(readlink "${link_path}")"
+
+    case "${target}" in
+      "${root}"/*)
+        local relative_target
+        relative_target="$("${PYTHON_BIN}" -c 'import os,sys; print(os.path.relpath(sys.argv[2], os.path.dirname(sys.argv[1])))' "${link_path}" "${target}")"
+        ln -sfn "${relative_target}" "${link_path}"
+        ;;
+    esac
+  done < <(find "${root}" -type l -print0)
+}
+
 require_cmd() {
   local name="$1"
   if ! command -v "${name}" >/dev/null 2>&1; then
@@ -98,6 +115,8 @@ if [ "${SKIP_NODE_DEPS}" != "1" ] && [ "${#NODE_PACKAGES[@]}" -gt 0 ]; then
   mkdir -p "${NODE_RUNTIME_DIR}"
   npm install --global --prefix "${NODE_RUNTIME_DIR}" "${NODE_PACKAGES[@]}"
 fi
+
+rewrite_absolute_symlinks "${OUTPUT_ROOT}"
 
 cat > "${BIN_DIR}/hb" <<'EOF'
 #!/usr/bin/env bash

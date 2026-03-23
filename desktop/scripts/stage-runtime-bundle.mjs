@@ -56,7 +56,7 @@ async function ensureCleanStageDir() {
 
 async function copyRuntimeDirectory(sourceDir) {
   log(`copying runtime directory from ${sourceDir}`);
-  await fs.cp(sourceDir, stageDir, { recursive: true });
+  await fs.cp(sourceDir, stageDir, { recursive: true, verbatimSymlinks: true });
 }
 
 async function extractRuntimeTarball(tarballPath) {
@@ -75,7 +75,7 @@ async function extractRuntimeTarball(tarballPath) {
     throw new Error(`Runtime tarball ${tarballPath} did not contain a runtime root with bin/sandbox-runtime.`);
   }
 
-  await fs.cp(runtimeRoot, stageDir, { recursive: true });
+  await fs.cp(runtimeRoot, stageDir, { recursive: true, verbatimSymlinks: true });
 }
 
 async function downloadRuntimeTarball(url, destinationTarball) {
