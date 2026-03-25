@@ -164,7 +164,6 @@ class _OpencodeRuntimeConfig:
 @dataclass(frozen=True)
 class _RunningWorkspaceMcpSidecar:
     physical_server_id: str
-    sandbox_id: str
     url: str
     timeout_ms: int
     pid: int | None
@@ -1149,7 +1148,6 @@ async def _start_workspace_mcp_sidecar(
     *,
     workspace_dir: Path,
     compiled_plan: CompiledWorkspaceRuntimePlan,
-    workspace_id: str,
     sandbox_id: str,
     physical_server_id: str,
 ) -> _RunningWorkspaceMcpSidecar | None:
@@ -1172,9 +1170,7 @@ async def _start_workspace_mcp_sidecar(
     try:
         expected_fingerprint = _workspace_mcp_catalog_fingerprint(compiled_plan)
         request_payload = _WorkspaceMcpSidecarCliRequest(
-            workspace_id=workspace_id,
             workspace_dir=str(workspace_dir),
-            sandbox_id=sandbox_id,
             physical_server_id=physical_server_id,
             expected_fingerprint=expected_fingerprint,
             timeout_ms=timeout_ms,
@@ -1216,21 +1212,20 @@ async def _start_workspace_mcp_sidecar(
         logger.info(
             "%s workspace MCP sidecar for physical_id=%s url=%s",
             "Reused" if response.reused else "Started",
-            response.physical_server_id,
+            physical_server_id,
             response.url,
             extra={
                 "event": "workspace_mcp.sidecar",
                 "outcome": "reuse" if response.reused else "start",
                 "logical_server_id": _WORKSPACE_MCP_SERVER_ID,
-                "physical_server_id": response.physical_server_id,
-                "sandbox_id": response.sandbox_id,
+                "physical_server_id": physical_server_id,
+                "sandbox_id": sandbox_id,
             },
         )
         return _RunningWorkspaceMcpSidecar(
-            physical_server_id=response.physical_server_id,
-            sandbox_id=response.sandbox_id,
+            physical_server_id=physical_server_id,
             url=response.url,
-            timeout_ms=response.timeout_ms,
+            timeout_ms=timeout_ms,
             pid=response.pid,
             reused=response.reused,
         )
@@ -3150,7 +3145,6 @@ async def _execute_request_opencode(request: RunnerRequest) -> int:
             sidecar = await _start_workspace_mcp_sidecar(
                 workspace_dir=workspace_dir,
                 compiled_plan=compiled_plan,
-                workspace_id=request.workspace_id,
                 sandbox_id=sandbox_id,
                 physical_server_id=workspace_physical_server_id,
             )

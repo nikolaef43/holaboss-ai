@@ -9,8 +9,6 @@ const WORKSPACE_MCP_STATE_VERSION = 1;
 const WORKSPACE_MCP_READY_POLL_MS = 200;
 
 type SidecarStateEntry = {
-  workspace_id: string;
-  sandbox_id: string;
   physical_server_id: string;
   url: string;
   pid: number;
@@ -32,9 +30,7 @@ type WorkspaceMcpSidecarDeps = {
 };
 
 export interface WorkspaceMcpSidecarCliRequest {
-  workspace_id: string;
   workspace_dir: string;
-  sandbox_id: string;
   physical_server_id: string;
   expected_fingerprint: string;
   timeout_ms: number;
@@ -44,10 +40,7 @@ export interface WorkspaceMcpSidecarCliRequest {
 }
 
 export interface WorkspaceMcpSidecarCliResponse {
-  physical_server_id: string;
-  sandbox_id: string;
   url: string;
-  timeout_ms: number;
   pid: number;
   reused: boolean;
 }
@@ -249,17 +242,12 @@ export async function startWorkspaceMcpSidecar(
   if (stateEntry) {
     if (
       stateEntry.url &&
-      stateEntry.workspace_id === request.workspace_id &&
-      stateEntry.sandbox_id === request.sandbox_id &&
       stateEntry.config_fingerprint === request.expected_fingerprint &&
       pidAlive(Number(stateEntry.pid ?? 0)) &&
       (await (deps.isReady ?? workspaceMcpIsReady)(stateEntry.url))
     ) {
       return {
-        physical_server_id: request.physical_server_id,
-        sandbox_id: request.sandbox_id,
         url: stateEntry.url,
-        timeout_ms: request.timeout_ms,
         pid: Number(stateEntry.pid ?? 0),
         reused: true
       };
@@ -315,8 +303,6 @@ export async function startWorkspaceMcpSidecar(
     throw error;
   }
   stateEntries[request.physical_server_id] = {
-    workspace_id: request.workspace_id,
-    sandbox_id: request.sandbox_id,
     physical_server_id: request.physical_server_id,
     url,
     pid: child.pid ?? 0,
@@ -325,10 +311,7 @@ export async function startWorkspaceMcpSidecar(
   };
   writeWorkspaceMcpSidecarState(workspaceDir, stateEntries);
   return {
-    physical_server_id: request.physical_server_id,
-    sandbox_id: request.sandbox_id,
     url,
-    timeout_ms: request.timeout_ms,
     pid: child.pid ?? 0,
     reused: false
   };

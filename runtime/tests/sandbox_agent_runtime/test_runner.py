@@ -166,8 +166,8 @@ def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _noop_workspace_mcp_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _start_sidecar(*, workspace_dir, compiled_plan, workspace_id, sandbox_id, physical_server_id):
-        del workspace_dir, compiled_plan, workspace_id, sandbox_id, physical_server_id
+    async def _start_sidecar(*, workspace_dir, compiled_plan, sandbox_id, physical_server_id):
+        del workspace_dir, compiled_plan, sandbox_id, physical_server_id
         return None
 
     async def _stop_sidecar(sidecar):
@@ -1588,10 +1588,7 @@ async def test_start_workspace_mcp_sidecar_invokes_local_ts_cli(
         captured["command"] = command
         captured["kwargs"] = kwargs
         payload = {
-            "physical_server_id": "workspace__abc123",
-            "sandbox_id": "sandbox-1",
             "url": "http://127.0.0.1:4567/mcp",
-            "timeout_ms": 4321,
             "pid": 90210,
             "reused": False,
         }
@@ -1607,7 +1604,6 @@ async def test_start_workspace_mcp_sidecar_invokes_local_ts_cli(
     sidecar = await _start_workspace_mcp_sidecar(
         workspace_dir=workspace_dir,
         compiled_plan=plan,
-        workspace_id="workspace-1",
         sandbox_id="sandbox-1",
         physical_server_id="workspace__abc123",
     )
@@ -1623,9 +1619,7 @@ async def test_start_workspace_mcp_sidecar_invokes_local_ts_cli(
     )
     encoded_request = str(command[3])
     payload = json.loads(base64.b64decode(encoded_request.encode("utf-8")).decode("utf-8"))
-    assert payload["workspace_id"] == "workspace-1"
     assert payload["workspace_dir"] == str(workspace_dir)
-    assert payload["sandbox_id"] == "sandbox-1"
     assert payload["physical_server_id"] == "workspace__abc123"
     assert payload["timeout_ms"] == 4321
     assert payload["python_executable"] == runner_module.sys.executable
@@ -1689,7 +1683,6 @@ async def test_start_workspace_mcp_sidecar_reports_cli_failure_detail(
         await _start_workspace_mcp_sidecar(
             workspace_dir=Path("/tmp/workspace-1"),
             compiled_plan=plan,
-            workspace_id="workspace-1",
             sandbox_id="sandbox-1",
             physical_server_id=physical_server_id,
         )
@@ -1707,7 +1700,6 @@ async def test_stop_workspace_mcp_sidecar_terminates_only_nonreused_pid(
     await _stop_workspace_mcp_sidecar(
         runner_module._RunningWorkspaceMcpSidecar(
             physical_server_id="workspace__abc123",
-            sandbox_id="sandbox-1",
             url="http://127.0.0.1:4567/mcp",
             timeout_ms=10000,
             pid=111,
@@ -1717,7 +1709,6 @@ async def test_stop_workspace_mcp_sidecar_terminates_only_nonreused_pid(
     await _stop_workspace_mcp_sidecar(
         runner_module._RunningWorkspaceMcpSidecar(
             physical_server_id="workspace__abc123",
-            sandbox_id="sandbox-1",
             url="http://127.0.0.1:4567/mcp",
             timeout_ms=10000,
             pid=222,

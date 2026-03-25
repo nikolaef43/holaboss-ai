@@ -25,9 +25,7 @@ function makeTempWorkspaceRoot(prefix: string): { root: string; workspaceDir: st
 
 function makeRequest(workspaceDir: string) {
   return {
-    workspace_id: "workspace-1",
     workspace_dir: workspaceDir,
-    sandbox_id: "sandbox-1",
     physical_server_id: "workspace-local",
     expected_fingerprint: "fp-1",
     timeout_ms: 45000,
@@ -49,8 +47,6 @@ test("startWorkspaceMcpSidecar reuses a ready persisted sidecar", async () => {
         version: 1,
         sidecars: {
           [request.physical_server_id]: {
-            workspace_id: request.workspace_id,
-            sandbox_id: request.sandbox_id,
             physical_server_id: request.physical_server_id,
             url: "http://127.0.0.1:9000/mcp",
             pid: 4321,
@@ -83,10 +79,7 @@ test("startWorkspaceMcpSidecar reuses a ready persisted sidecar", async () => {
 
   assert.equal(spawned, false);
   assert.deepEqual(result, {
-    physical_server_id: request.physical_server_id,
-    sandbox_id: request.sandbox_id,
     url: "http://127.0.0.1:9000/mcp",
-    timeout_ms: request.timeout_ms,
     pid: 4321,
     reused: true
   });
@@ -104,8 +97,6 @@ test("startWorkspaceMcpSidecar terminates stale state, spawns, and persists the 
         version: 1,
         sidecars: {
           [request.physical_server_id]: {
-            workspace_id: request.workspace_id,
-            sandbox_id: request.sandbox_id,
             physical_server_id: request.physical_server_id,
             url: "http://127.0.0.1:8000/mcp",
             pid: 111,
@@ -153,10 +144,7 @@ test("startWorkspaceMcpSidecar terminates stale state, spawns, and persists the 
   });
 
   assert.deepEqual(result, {
-    physical_server_id: request.physical_server_id,
-    sandbox_id: request.sandbox_id,
     url: "http://127.0.0.1:24567/mcp",
-    timeout_ms: request.timeout_ms,
     pid: 9876,
     reused: false
   });
@@ -188,8 +176,6 @@ test("startWorkspaceMcpSidecar terminates stale state, spawns, and persists the 
     version: 1,
     sidecars: {
       [request.physical_server_id]: {
-        workspace_id: request.workspace_id,
-        sandbox_id: request.sandbox_id,
         physical_server_id: request.physical_server_id,
         url: "http://127.0.0.1:24567/mcp",
         pid: 9876,
@@ -248,10 +234,7 @@ test("runWorkspaceMcpSidecarCli writes JSON response for a valid request", async
       async startSidecar(parsed) {
         assert.deepEqual(parsed, request);
         return {
-          physical_server_id: request.physical_server_id,
-          sandbox_id: request.sandbox_id,
           url: "http://127.0.0.1:24567/mcp",
-          timeout_ms: request.timeout_ms,
           pid: 9876,
           reused: false
         };
@@ -262,10 +245,7 @@ test("runWorkspaceMcpSidecarCli writes JSON response for a valid request", async
   assert.equal(exitCode, 0);
   assert.equal(stderr, "");
   assert.deepEqual(JSON.parse(stdout), {
-    physical_server_id: request.physical_server_id,
-    sandbox_id: request.sandbox_id,
     url: "http://127.0.0.1:24567/mcp",
-    timeout_ms: request.timeout_ms,
     pid: 9876,
     reused: false
   });

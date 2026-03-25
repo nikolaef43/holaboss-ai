@@ -59,9 +59,7 @@ class HarnessHostOpencodeRequest(BaseModel):
 
 
 class WorkspaceMcpSidecarCliRequest(BaseModel):
-    workspace_id: str
     workspace_dir: str
-    sandbox_id: str
     physical_server_id: str
     expected_fingerprint: str
     timeout_ms: int
@@ -71,10 +69,7 @@ class WorkspaceMcpSidecarCliRequest(BaseModel):
 
 
 class WorkspaceMcpSidecarCliResponse(BaseModel):
-    physical_server_id: str
-    sandbox_id: str
     url: str
-    timeout_ms: int
     pid: int
     reused: bool
 
