@@ -19,11 +19,12 @@ from sandbox_agent_runtime.runner import (
     _execute_request,
     _map_opencode_event,
     _model_proxy_base_root_url,
-    _opencode_provider_config_payload,
     _resolve_model_client_config,
     _restart_opencode_sidecar,
     _selected_harness,
     _should_emit_opencode_event,
+    _start_workspace_mcp_sidecar,
+    _stop_workspace_mcp_sidecar,
     _workspace_mcp_failure_detail,
     _workspace_mcp_log_path,
 )
@@ -35,7 +36,7 @@ from sandbox_agent_runtime.runtime_config_adapter import (
 )
 
 _RUNTIME_EXEC_CONTEXT_KEY = "_sandbox_runtime_exec_v1"
-_ORIGINAL_ENSURE_OPENCODE_MCP_SERVERS = runner_module._ensure_opencode_mcp_servers
+_DEFAULT_MODEL_HEADERS = object()
 
 
 def _runtime_exec_context(
@@ -65,10 +66,93 @@ def _runtime_exec_context(
     }
 
 
+class _AsyncLineStream:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = [f"{line.rstrip()}\n".encode("utf-8") for line in lines]
+        self._index = 0
+
+    def __aiter__(self) -> _AsyncLineStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._index >= len(self._lines):
+            raise StopAsyncIteration
+        value = self._lines[self._index]
+        self._index += 1
+        return value
+
+
+class _AsyncReadStream:
+    def __init__(self, text: str) -> None:
+        self._payload = text.encode("utf-8")
+        self._consumed = False
+
+    async def read(self, size: int = -1) -> bytes:
+        del size
+        if self._consumed:
+            return b""
+        self._consumed = True
+        return self._payload
+
+
+class _FakeHarnessHostProcess:
+    def __init__(self, *, stdout_lines: list[str], stderr_text: str = "", return_code: int = 0) -> None:
+        self.stdout = _AsyncLineStream(stdout_lines)
+        self.stderr = _AsyncReadStream(stderr_text)
+        self._return_code = return_code
+
+    async def wait(self) -> int:
+        return self._return_code
+
+
+class _FakeCliProcess:
+    def __init__(self, *, stdout_text: str = "", stderr_text: str = "", return_code: int = 0) -> None:
+        self._stdout = stdout_text.encode("utf-8")
+        self._stderr = stderr_text.encode("utf-8")
+        self.returncode = return_code
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, self._stderr
+
+
+def _opencode_runtime_config_fixture(
+    *,
+    workspace_tool_ids: tuple[str, ...] = ("workspace.read",),
+    workspace_skill_ids: tuple[str, ...] = ("skill-1",),
+) -> runner_module._OpencodeRuntimeConfig:
+    return runner_module._OpencodeRuntimeConfig(
+        provider_id="openai",
+        model_id="gpt-5",
+        mode="code",
+        system_prompt="You are concise.",
+        model_client_config=_model_client_config_fixture(),
+        tools={"read": True},
+        workspace_tool_ids=workspace_tool_ids,
+        mcp_servers=(),
+        output_schema_member_id=None,
+        output_schema_model=None,
+        output_format=None,
+        workspace_config_checksum="checksum-1",
+        workspace_skill_ids=workspace_skill_ids,
+    )
+
+
+def _model_client_config_fixture(
+    *, default_headers: dict[str, str] | None | object = _DEFAULT_MODEL_HEADERS
+) -> runner_module._ModelClientConfig:
+    return runner_module._ModelClientConfig(
+        model_proxy_provider="openai_compatible",
+        api_key="token-1",
+        base_url="http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+        default_headers={"X-Test": "1"} if default_headers is _DEFAULT_MODEL_HEADERS else default_headers,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clear_harness_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
     monkeypatch.setenv("HOLABOSS_MODEL_PROXY_BASE_URL", "http://sandbox-runtime:3060/api/v1/model-proxy")
+    monkeypatch.delenv("SANDBOX_AGENT_USE_TS_HARNESS_HOST", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -116,6 +200,386 @@ def test_selected_harness_defaults_to_opencode_without_explicit_override(monkeyp
     assert _selected_harness(request=request) == "opencode"
 
 
+@pytest.mark.asyncio
+async def test_start_opencode_apps_via_runtime_api_posts_bootstrap_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = RunnerRequest(
+        holaboss_user_id="user-1",
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context={},
+    )
+    workspace_dir = Path("/tmp/workspace-1")
+    app = SimpleNamespace(
+        app_id="app-a",
+        mcp=SimpleNamespace(transport="http-sse", port=3099, path="/mcp"),
+        health_check=SimpleNamespace(path="/health", timeout_s=60, interval_s=5),
+        env_contract=("HOLABOSS_USER_ID",),
+        start_command="npm run start",
+        base_dir="apps/app-a",
+        lifecycle=SimpleNamespace(setup="", start="", stop=""),
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "applications": [
+                    {
+                        "app_id": "app-a",
+                        "mcp_url": "http://localhost:13100/mcp",
+                        "timeout_ms": 60000,
+                    }
+                ]
+            }
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+            return False
+
+        async def post(self, url: str, *, json: dict[str, object]):
+            captured["url"] = url
+            captured["json"] = json
+            return _FakeResponse()
+
+    monkeypatch.setenv("SANDBOX_RUNTIME_API_URL", "http://runtime.example")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: _FakeClient())
+
+    entries = await runner_module._start_opencode_apps_via_runtime_api(
+        request=request,
+        workspace_dir=workspace_dir,
+        resolved_applications=(app,),
+    )
+
+    assert entries == (
+        {
+            "name": "app-a",
+            "config": {
+                "type": "remote",
+                "url": "http://localhost:13100/mcp",
+                "enabled": True,
+                "headers": {"X-Workspace-Id": "workspace-1"},
+                "timeout": 60000,
+            },
+        },
+    )
+    assert captured == {
+        "url": "http://runtime.example/api/v1/internal/workspaces/workspace-1/opencode-apps/start",
+        "json": {
+            "workspace_dir": "/tmp/workspace-1",
+            "holaboss_user_id": "",
+            "resolved_applications": [
+                {
+                    "app_id": "app-a",
+                    "mcp": {"transport": "http-sse", "port": 3099, "path": "/mcp"},
+                    "health_check": {"path": "/health", "timeout_s": 60, "interval_s": 5},
+                    "env_contract": ["HOLABOSS_USER_ID"],
+                    "start_command": "npm run start",
+                    "base_dir": "apps/app-a",
+                    "lifecycle": {"setup": "", "start": "", "stop": ""},
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_opencode_resolved_applications_falls_back_on_runtime_api_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = RunnerRequest(
+        holaboss_user_id="user-1",
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context={},
+    )
+    workspace_dir = Path("/tmp/workspace-1")
+    app = SimpleNamespace(
+        app_id="app-a",
+        mcp=SimpleNamespace(transport="http-sse", port=3099, path="/mcp"),
+        health_check=SimpleNamespace(path="/health", timeout_s=60, interval_s=5),
+        lifecycle=SimpleNamespace(setup="", start="", stop=""),
+    )
+    started: dict[str, object] = {}
+
+    async def _fail_runtime_api(**kwargs):
+        del kwargs
+        raise httpx.ConnectError("ts bootstrap unavailable")
+
+    async def _local_ts_fallback(**kwargs):
+        started.update(kwargs)
+        return (
+            {
+                "name": "app-a",
+                "config": {
+                    "type": "remote",
+                    "url": "http://localhost:13100/mcp",
+                    "enabled": True,
+                    "headers": {"X-Workspace-Id": "workspace-1"},
+                    "timeout": 60000,
+                },
+            },
+        )
+
+    monkeypatch.setenv("SANDBOX_AGENT_ENABLE_PYTHON_APP_LIFECYCLE_FALLBACK", "1")
+    monkeypatch.setattr(runner_module, "_start_opencode_apps_via_runtime_api", _fail_runtime_api)
+    monkeypatch.setattr(runner_module, "_start_opencode_apps_via_local_ts_lifecycle", _local_ts_fallback)
+
+    entries = await runner_module._start_opencode_resolved_applications(
+        request=request,
+        workspace_dir=workspace_dir,
+        resolved_applications=(app,),
+    )
+
+    assert started == {
+        "request": request,
+        "workspace_dir": workspace_dir,
+        "resolved_applications": (app,),
+    }
+    assert entries == (
+        {
+            "name": "app-a",
+            "config": {
+                "type": "remote",
+                "url": "http://localhost:13100/mcp",
+                "enabled": True,
+                "headers": {"X-Workspace-Id": "workspace-1"},
+                "timeout": 60000,
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_opencode_resolved_applications_raises_when_transport_fallback_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = RunnerRequest(
+        holaboss_user_id="user-1",
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context={},
+    )
+    workspace_dir = Path("/tmp/workspace-1")
+    app = SimpleNamespace(
+        app_id="app-a",
+        health_check=SimpleNamespace(timeout_s=60),
+    )
+
+    async def _fail_runtime_api(**kwargs):
+        del kwargs
+        raise httpx.ConnectError("ts bootstrap unavailable")
+
+    async def _unexpected_local_ts_fallback(**kwargs):
+        del kwargs
+        raise AssertionError("local ts lifecycle fallback should stay disabled by default")
+
+    monkeypatch.delenv("SANDBOX_AGENT_ENABLE_PYTHON_APP_LIFECYCLE_FALLBACK", raising=False)
+    monkeypatch.setattr(runner_module, "_start_opencode_apps_via_runtime_api", _fail_runtime_api)
+    monkeypatch.setattr(runner_module, "_start_opencode_apps_via_local_ts_lifecycle", _unexpected_local_ts_fallback)
+
+    with pytest.raises(RuntimeError, match="SANDBOX_AGENT_ENABLE_PYTHON_APP_LIFECYCLE_FALLBACK=1"):
+        await runner_module._start_opencode_resolved_applications(
+            request=request,
+            workspace_dir=workspace_dir,
+            resolved_applications=(app,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_opencode_resolved_applications_raises_on_invalid_ts_bootstrap_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = RunnerRequest(
+        holaboss_user_id="user-1",
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context={},
+    )
+    workspace_dir = Path("/tmp/workspace-1")
+    app = SimpleNamespace(
+        app_id="app-a",
+        health_check=SimpleNamespace(timeout_s=60),
+    )
+
+    async def _invalid_runtime_api(**kwargs):
+        del kwargs
+        raise RuntimeError("invalid opencode app bootstrap response")
+
+    async def _unexpected_local_ts_fallback(**kwargs):
+        del kwargs
+        raise AssertionError("local ts lifecycle fallback should not run for invalid TS bootstrap responses")
+
+    monkeypatch.setattr(runner_module, "_start_opencode_apps_via_runtime_api", _invalid_runtime_api)
+    monkeypatch.setattr(runner_module, "_start_opencode_apps_via_local_ts_lifecycle", _unexpected_local_ts_fallback)
+
+    with pytest.raises(RuntimeError, match="invalid opencode app bootstrap response"):
+        await runner_module._start_opencode_resolved_applications(
+            request=request,
+            workspace_dir=workspace_dir,
+            resolved_applications=(app,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_opencode_apps_via_local_ts_lifecycle_invokes_cli_and_parses_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    request = RunnerRequest(
+        holaboss_user_id="user-1",
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context={},
+    )
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir()
+    entry_path = tmp_path / "opencode-app-bootstrap.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    app = SimpleNamespace(
+        app_id="app-a",
+        mcp=SimpleNamespace(transport="http-sse", port=3099, path="/mcp"),
+        health_check=SimpleNamespace(path="/health", timeout_s=60, interval_s=5),
+        env_contract=("HOLABOSS_USER_ID",),
+        start_command="npm run start",
+        base_dir="apps/app-a",
+        lifecycle=SimpleNamespace(setup="", start="", stop=""),
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (
+                json.dumps(
+                    {
+                        "applications": [
+                            {
+                                "app_id": "app-a",
+                                "mcp_url": "http://localhost:13100/mcp",
+                                "timeout_ms": 60000,
+                            }
+                        ]
+                    }
+                ).encode("utf-8"),
+                b"",
+            )
+
+    async def _fake_create_subprocess_exec(*command: object, **kwargs: object) -> _FakeProcess:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return _FakeProcess()
+
+    monkeypatch.setattr(runner_module, "_ts_opencode_app_bootstrap_entry_path", lambda: entry_path)
+    monkeypatch.setattr(runner_module, "_ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    entries = await runner_module._start_opencode_apps_via_local_ts_lifecycle(
+        request=request,
+        workspace_dir=workspace_dir,
+        resolved_applications=(app,),
+    )
+
+    assert entries == (
+        {
+            "name": "app-a",
+            "config": {
+                "type": "remote",
+                "url": "http://localhost:13100/mcp",
+                "enabled": True,
+                "headers": {"X-Workspace-Id": "workspace-1"},
+                "timeout": 60000,
+            },
+        },
+    )
+    assert captured["command"]
+    command = captured["command"]
+    assert isinstance(command, tuple)
+    assert command[0] == "node"
+    assert command[1] == str(entry_path)
+    assert command[2] == "--request-base64"
+    decoded_request = json.loads(base64.b64decode(str(command[3])).decode("utf-8"))
+    assert decoded_request == {
+        "workspace_id": "workspace-1",
+        "workspace_dir": str(workspace_dir),
+        "holaboss_user_id": "",
+        "resolved_applications": [
+            {
+                "app_id": "app-a",
+                "mcp": {"transport": "http-sse", "port": 3099, "path": "/mcp"},
+                "health_check": {"path": "/health", "timeout_s": 60, "interval_s": 5},
+                "env_contract": ["HOLABOSS_USER_ID"],
+                "start_command": "npm run start",
+                "base_dir": "apps/app-a",
+                "lifecycle": {"setup": "", "start": "", "stop": ""},
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_opencode_apps_via_local_ts_lifecycle_raises_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    request = RunnerRequest(
+        holaboss_user_id="user-1",
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context={},
+    )
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir()
+    entry_path = tmp_path / "opencode-app-bootstrap.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    app = SimpleNamespace(
+        app_id="app-a",
+        mcp=SimpleNamespace(transport="http-sse", port=3099, path="/mcp"),
+        health_check=SimpleNamespace(path="/health", timeout_s=60, interval_s=5),
+        lifecycle=SimpleNamespace(setup="", start="", stop=""),
+    )
+
+    class _FakeProcess:
+        returncode = 1
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return (b"", b"bootstrap failed")
+
+    async def _fake_create_subprocess_exec(*command: object, **kwargs: object) -> _FakeProcess:
+        del command, kwargs
+        return _FakeProcess()
+
+    monkeypatch.setattr(runner_module, "_ts_opencode_app_bootstrap_entry_path", lambda: entry_path)
+    monkeypatch.setattr(runner_module, "_ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError, match="bootstrap failed"):
+        await runner_module._start_opencode_apps_via_local_ts_lifecycle(
+            request=request,
+            workspace_dir=workspace_dir,
+            resolved_applications=(app,),
+        )
+
+
 def test_model_proxy_base_root_url_accepts_product_base_url_alias(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HOLABOSS_MODEL_PROXY_BASE_URL", raising=False)
     monkeypatch.setenv("HOLABOSS_MODEL_PROXY_BASE_URL", "https://runtime.example/api/v1/model-proxy")
@@ -151,27 +615,156 @@ def test_opencode_base_url_prefers_explicit_env(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
-async def test_restart_opencode_sidecar_reuses_matching_healthy_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
-    runner_module._write_opencode_sidecar_state(
-        {
-            "pid": 12345,
-            "url": "http://127.0.0.1:4096/mcp",
-            "workspace_id": "workspace-1",
-            "config_fingerprint": "fingerprint-1",
-        }
-    )
+async def test_restart_opencode_sidecar_invokes_local_ts_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    entry_path = tmp_path / "opencode-sidecar.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    captured: dict[str, object] = {}
 
-    async def _fake_ready(*, url: str) -> bool:
-        assert url == "http://127.0.0.1:4096/mcp"
-        return True
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "outcome": "reused",
+                    "pid": 12345,
+                    "url": "http://127.0.0.1:4096/mcp",
+                }
+            )
+        )
 
-    async def _unexpected_subprocess_exec(*args, **kwargs):
-        raise AssertionError(f"unexpected subprocess restart: args={args} kwargs={kwargs}")
-
-    monkeypatch.setattr("sandbox_agent_runtime.runner._workspace_mcp_is_ready", _fake_ready)
-    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _unexpected_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_sidecar_entry_path", lambda: entry_path)
 
     await _restart_opencode_sidecar(config_fingerprint="fingerprint-1", workspace_id="workspace-1")
+
+    command = captured["command"]
+    assert command[:3] == (
+        "node",
+        str(entry_path),
+        "--request-base64",
+    )
+    payload = json.loads(base64.b64decode(str(command[3])).decode("utf-8"))
+    assert payload == {
+        "workspace_root": str(Path(runner_module.WORKSPACE_ROOT)),
+        "workspace_id": "workspace-1",
+        "config_fingerprint": "fingerprint-1",
+        "allow_reuse_existing": False,
+        "host": runner_module._opencode_server_host(),
+        "port": runner_module._opencode_server_port(),
+        "readiness_url": runner_module._opencode_base_url() + "/mcp",
+        "ready_timeout_s": runner_module._opencode_ready_timeout_seconds(),
+    }
+    assert captured["kwargs"] == {
+        "cwd": str(Path(runner_module.WORKSPACE_ROOT)),
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+
+
+@pytest.mark.asyncio
+async def test_restart_opencode_sidecar_raises_on_cli_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry_path = tmp_path / "opencode-sidecar.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(return_code=1, stderr_text="restart failed")
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_sidecar_entry_path", lambda: entry_path)
+
+    with pytest.raises(RuntimeError, match="restart failed"):
+        await _restart_opencode_sidecar(config_fingerprint="fingerprint-1", workspace_id="workspace-1")
+
+
+@pytest.mark.asyncio
+async def test_write_opencode_config_via_local_ts_invokes_cli_and_parses_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry_path = tmp_path / "opencode-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "path": str(Path(runner_module.WORKSPACE_ROOT) / "opencode.json"),
+                    "provider_config_changed": True,
+                    "model_selection_changed": False,
+                }
+            )
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_config_entry_path", lambda: entry_path)
+
+    config_path, provider_changed, model_changed = await runner_module._write_opencode_config_via_local_ts(
+        provider_id="openai",
+        model_id="gpt-5.2",
+        model_client_config=_model_client_config_fixture(),
+    )
+
+    assert config_path == Path(runner_module.WORKSPACE_ROOT) / "opencode.json"
+    assert provider_changed is True
+    assert model_changed is False
+    command = captured["command"]
+    assert command[:3] == (
+        "node",
+        str(entry_path),
+        "--request-base64",
+    )
+    payload = json.loads(base64.b64decode(str(command[3])).decode("utf-8"))
+    assert payload == {
+        "workspace_root": str(Path(runner_module.WORKSPACE_ROOT)),
+        "provider_id": "openai",
+        "model_id": "gpt-5.2",
+        "model_client": {
+            "model_proxy_provider": "openai_compatible",
+            "api_key": "token-1",
+            "base_url": "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+            "default_headers": {"X-Test": "1"},
+        },
+    }
+    assert captured["kwargs"] == {
+        "cwd": str(Path(runner_module.WORKSPACE_ROOT)),
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+
+
+@pytest.mark.asyncio
+async def test_write_opencode_config_via_local_ts_raises_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry_path = tmp_path / "opencode-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(return_code=1, stderr_text="config failed")
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_config_entry_path", lambda: entry_path)
+
+    with pytest.raises(RuntimeError, match="config failed"):
+        await runner_module._write_opencode_config_via_local_ts(
+            provider_id="openai",
+            model_id="gpt-5.2",
+            model_client_config=_model_client_config_fixture(),
+        )
 
 
 def test_workspace_mcp_failure_detail_includes_stderr_and_stdout_tails(
@@ -222,9 +815,14 @@ async def test_wait_for_opencode_ready_uses_opencode_error_label(monkeypatch: py
 async def test_execute_request_emits_run_failed_without_model_proxy_config(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     monkeypatch.delenv("SANDBOX_MODEL_PROXY_ENABLE_DIRECT_OPENAI_FALLBACK", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    workspace_root = tmp_path / "workspace-root"
+    workspace_dir = workspace_root / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("sandbox_agent_runtime.runner.WORKSPACE_ROOT", str(workspace_root))
 
     async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
         del workspace_dir, workspace_id
@@ -233,6 +831,28 @@ async def test_execute_request_emits_run_failed_without_model_proxy_config(
     monkeypatch.setattr(
         "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
         _fake_compile_workspace_runtime_plan,
+    )
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
+        lambda **kwargs: asyncio.sleep(0, result=_opencode_runtime_config_fixture()),
+    )
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._stage_workspace_skills_for_opencode",
+        lambda *, workspace_dir: asyncio.sleep(0, result=(False, ())),
+    )
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._stage_workspace_commands_for_opencode",
+        lambda *, workspace_dir: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._write_opencode_config_via_local_ts",
+        lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError(
+                "missing required runtime exec context values: "
+                "_sandbox_runtime_exec_v1.model_proxy_api_key, "
+                "_sandbox_runtime_exec_v1.sandbox_id"
+            )
+        ),
     )
 
     request = RunnerRequest(
@@ -303,6 +923,378 @@ def test_decode_request_round_trip() -> None:
     assert request.debug is True
 
 
+@pytest.mark.asyncio
+async def test_try_execute_request_opencode_via_harness_host_relays_events_and_persists_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SANDBOX_AGENT_USE_TS_HARNESS_HOST", "1")
+    entry_path = tmp_path / "index.mjs"
+    entry_path.write_text("// built harness host placeholder\n", encoding="utf-8")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+
+    captured_args: dict[str, tuple[object, ...]] = {}
+
+    async def _fake_subprocess_exec(*args, **kwargs):
+        captured_args["args"] = args
+        captured_args["kwargs"] = kwargs
+        return _FakeHarnessHostProcess(
+            stdout_lines=[
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 1,
+                        "event_type": "run_started",
+                        "payload": {"provider_id": "openai", "model_id": "gpt-5"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 2,
+                        "event_type": "run_completed",
+                        "payload": {"harness_session_id": "host-session-1"},
+                    }
+                ),
+            ]
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_subprocess_exec)
+
+    request = RunnerRequest(
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
+    )
+    runtime_config = _opencode_runtime_config_fixture()
+    model_client_config = _model_client_config_fixture()
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    used = await runner_module._try_execute_request_opencode_via_harness_host(
+        request=request,
+        workspace_dir=workspace_dir,
+        runtime_config=runtime_config,
+        model_client_config=model_client_config,
+        mcp_server_id_map={},
+        sidecar=None,
+        push_client=None,
+    )
+
+    assert used is True
+    assert captured_args["args"][0] == "node"
+    assert captured_args["args"][1] == str(entry_path)
+    assert captured_args["args"][2] == "run-opencode"
+    assert captured_args["args"][3] == "--request-base64"
+    assert captured_args["kwargs"]["cwd"] == str(runner_module._runtime_root_dir())
+    assert captured_args["kwargs"]["stdout"] == asyncio.subprocess.PIPE
+    request_payload = json.loads(base64.b64decode(captured_args["args"][4]).decode("utf-8"))
+    assert request_payload["workspace_dir"] == str(workspace_dir)
+    assert request_payload["harness_session_id"] == "opencode-session-1"
+    assert request_payload["persisted_harness_session_id"] is None
+    assert request_payload["opencode_base_url"] == runner_module._opencode_base_url()
+    assert request_payload["timeout_seconds"] == runner_module._opencode_timeout_seconds()
+    assert runner_module._read_workspace_main_session_id(workspace_dir=workspace_dir, harness="opencode") == "host-session-1"
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    started = json.loads(lines[0])
+    completed = json.loads(lines[1])
+    assert started["event_type"] == "run_started"
+    assert completed["event_type"] == "run_completed"
+    assert completed["payload"]["harness_session_id"] == "host-session-1"
+
+
+@pytest.mark.asyncio
+async def test_try_execute_request_opencode_via_harness_host_includes_persisted_session_and_replaces_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SANDBOX_AGENT_USE_TS_HARNESS_HOST", "1")
+    entry_path = tmp_path / "index.mjs"
+    entry_path.write_text("// built harness host placeholder\n", encoding="utf-8")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+
+    captured_args: dict[str, tuple[object, ...]] = {}
+
+    async def _fake_subprocess_exec(*args, **kwargs):
+        captured_args["args"] = args
+        captured_args["kwargs"] = kwargs
+        return _FakeHarnessHostProcess(
+            stdout_lines=[
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 1,
+                        "event_type": "run_started",
+                        "payload": {"provider_id": "openai", "model_id": "gpt-5"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 2,
+                        "event_type": "run_completed",
+                        "payload": {
+                            "status": "success",
+                            "harness_session_id": "replacement-session-1",
+                        },
+                    }
+                ),
+            ]
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_subprocess_exec)
+
+    request = RunnerRequest(
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context=_runtime_exec_context(harness="opencode", harness_session_id="requested-session-1"),
+    )
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    runner_module._persist_workspace_main_session_id(
+        workspace_dir=workspace_dir,
+        harness="opencode",
+        session_id="persisted-session-1",
+    )
+
+    used = await runner_module._try_execute_request_opencode_via_harness_host(
+        request=request,
+        workspace_dir=workspace_dir,
+        runtime_config=_opencode_runtime_config_fixture(),
+        model_client_config=_model_client_config_fixture(),
+        mcp_server_id_map={},
+        sidecar=None,
+        push_client=None,
+    )
+
+    assert used is True
+    request_payload = json.loads(base64.b64decode(captured_args["args"][4]).decode("utf-8"))
+    assert request_payload["harness_session_id"] == "requested-session-1"
+    assert request_payload["persisted_harness_session_id"] == "persisted-session-1"
+    assert runner_module._read_workspace_main_session_id(workspace_dir=workspace_dir, harness="opencode") == (
+        "replacement-session-1"
+    )
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert [json.loads(line)["event_type"] for line in lines] == ["run_started", "run_completed"]
+
+
+@pytest.mark.asyncio
+async def test_try_execute_request_opencode_via_harness_host_persists_session_from_failed_terminal_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SANDBOX_AGENT_USE_TS_HARNESS_HOST", "1")
+    entry_path = tmp_path / "index.mjs"
+    entry_path.write_text("// built harness host placeholder\n", encoding="utf-8")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+
+    async def _fake_subprocess_exec(*args, **kwargs):
+        del args, kwargs
+        return _FakeHarnessHostProcess(
+            stdout_lines=[
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 1,
+                        "event_type": "run_started",
+                        "payload": {"provider_id": "openai", "model_id": "gpt-5"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 2,
+                        "event_type": "run_failed",
+                        "payload": {
+                            "type": "OpenCodeSessionError",
+                            "message": "permission denied",
+                            "harness_session_id": "failed-session-1",
+                        },
+                    }
+                ),
+            ]
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_subprocess_exec)
+
+    request = RunnerRequest(
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context=_runtime_exec_context(harness="opencode", harness_session_id="requested-session-1"),
+    )
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    used = await runner_module._try_execute_request_opencode_via_harness_host(
+        request=request,
+        workspace_dir=workspace_dir,
+        runtime_config=_opencode_runtime_config_fixture(),
+        model_client_config=_model_client_config_fixture(),
+        mcp_server_id_map={},
+        sidecar=None,
+        push_client=None,
+    )
+
+    assert used is True
+    assert runner_module._read_workspace_main_session_id(workspace_dir=workspace_dir, harness="opencode") == (
+        "failed-session-1"
+    )
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert [line["event_type"] for line in lines] == ["run_started", "run_failed"]
+    assert lines[-1]["payload"]["harness_session_id"] == "failed-session-1"
+
+
+@pytest.mark.asyncio
+async def test_try_execute_request_opencode_via_harness_host_emits_runtime_failure_without_terminal_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SANDBOX_AGENT_USE_TS_HARNESS_HOST", "1")
+    entry_path = tmp_path / "index.mjs"
+    entry_path.write_text("// built harness host placeholder\n", encoding="utf-8")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+
+    async def _fake_subprocess_exec(*args, **kwargs):
+        del args, kwargs
+        return _FakeHarnessHostProcess(
+            stdout_lines=[
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 4,
+                        "event_type": "run_started",
+                        "payload": {"provider_id": "openai", "model_id": "gpt-5"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "input_id": "input-1",
+                        "sequence": 5,
+                        "event_type": "output_delta",
+                        "payload": {"delta": "partial output"},
+                    }
+                ),
+            ],
+            stderr_text="terminal event missing\n",
+            return_code=0,
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_subprocess_exec)
+
+    request = RunnerRequest(
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context=_runtime_exec_context(harness="opencode", harness_session_id="requested-session-1"),
+    )
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    used = await runner_module._try_execute_request_opencode_via_harness_host(
+        request=request,
+        workspace_dir=workspace_dir,
+        runtime_config=_opencode_runtime_config_fixture(),
+        model_client_config=_model_client_config_fixture(),
+        mcp_server_id_map={},
+        sidecar=None,
+        push_client=None,
+    )
+
+    assert used is True
+    assert runner_module._read_workspace_main_session_id(workspace_dir=workspace_dir, harness="opencode") is None
+
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert [line["event_type"] for line in lines] == ["run_started", "output_delta", "run_failed"]
+    assert lines[-1]["sequence"] == 6
+    assert lines[-1]["payload"] == {
+        "type": "RuntimeError",
+        "message": "TypeScript OpenCode harness host ended before terminal event: terminal event missing",
+    }
+
+
+@pytest.mark.asyncio
+async def test_try_execute_request_opencode_via_harness_host_fails_when_not_implemented(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SANDBOX_AGENT_USE_TS_HARNESS_HOST", "1")
+    entry_path = tmp_path / "index.mjs"
+    entry_path.write_text("// built harness host placeholder\n", encoding="utf-8")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+
+    async def _fake_subprocess_exec(*args, **kwargs):
+        del args, kwargs
+        return _FakeHarnessHostProcess(
+            stdout_lines=[],
+            stderr_text="TypeScript OpenCode harness host is scaffolded, but the OpenCode adapter is not implemented yet.\n",
+            return_code=86,
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_subprocess_exec)
+
+    request = RunnerRequest(
+        workspace_id="workspace-1",
+        session_id="session-1",
+        input_id="input-1",
+        instruction="hello",
+        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
+    )
+    runtime_config = _opencode_runtime_config_fixture(workspace_tool_ids=(), workspace_skill_ids=())
+    model_client_config = _model_client_config_fixture(default_headers=None)
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    used = await runner_module._try_execute_request_opencode_via_harness_host(
+        request=request,
+        workspace_dir=workspace_dir,
+        runtime_config=runtime_config,
+        model_client_config=model_client_config,
+        mcp_server_id_map={},
+        sidecar=None,
+        push_client=None,
+    )
+
+    assert used is True
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert [line["event_type"] for line in lines] == ["run_failed"]
+    assert lines[0]["payload"] == {
+        "type": "RuntimeError",
+        "message": (
+            "TypeScript OpenCode harness host reported unimplemented OpenCode adapter: "
+            "TypeScript OpenCode harness host is scaffolded, but the OpenCode adapter is not implemented yet."
+        ),
+    }
+
+
 def test_resolve_model_client_config_prefers_runtime_context(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SANDBOX_MODEL_PROXY_ENABLE_DIRECT_OPENAI_FALLBACK", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -328,6 +1320,8 @@ def test_resolve_model_client_config_prefers_runtime_context(monkeypatch: pytest
         "X-Holaboss-Workspace-Id": "workspace-1",
         "X-Holaboss-Input-Id": "input-1",
     }
+
+
 
 
 def test_resolve_model_client_config_uses_direct_openai_fallback_when_enabled(
@@ -460,7 +1454,11 @@ def _single_plan(
     )
 
 
-def test_build_opencode_runtime_config_maps_workspace_tools_and_schema() -> None:
+@pytest.mark.asyncio
+async def test_build_opencode_runtime_config_maps_workspace_tools_and_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     class _HealthPlan(BaseModel):
         checks: list[str]
 
@@ -478,7 +1476,44 @@ def test_build_opencode_runtime_config_maps_workspace_tools_and_schema() -> None
         context=_runtime_exec_context(),
     )
 
-    config = _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=())
+    entry_path = tmp_path / "opencode-runtime-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "provider_id": "openai",
+                    "model_id": "gpt-5.2",
+                    "mode": "code",
+                    "system_prompt": "You are concise.",
+                    "model_client": {
+                        "model_proxy_provider": "openai_compatible",
+                        "api_key": "token-1",
+                        "base_url": "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+                        "default_headers": {"X-Test": "1"},
+                    },
+                    "tools": dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True)
+                    | {"workspace_read_file": True, "remote_lookup": True},
+                    "workspace_tool_ids": ["workspace.read_file", "remote.lookup"],
+                    "workspace_skill_ids": [],
+                    "output_schema_member_id": "workspace.general",
+                    "output_format": {
+                        "type": "json_schema",
+                        "schema": _HealthPlan.model_json_schema(),
+                        "retryCount": 2,
+                    },
+                    "workspace_config_checksum": "checksum-1",
+                }
+            )
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_runtime_config_entry_path", lambda: entry_path)
+
+    config = await _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=())
 
     expected_tools = dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True)
     expected_tools.update({"workspace_read_file": True, "remote_lookup": True})
@@ -505,7 +1540,171 @@ def test_workspace_sidecar_enabled_tool_ids_payload_only_includes_workspace_tool
     assert decoded == ["workspace.echo"]
 
 
-def test_build_opencode_runtime_config_maps_workspace_tools_to_physical_server_ids() -> None:
+@pytest.mark.asyncio
+async def test_start_workspace_mcp_sidecar_invokes_local_ts_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servers = (
+        ResolvedMcpServerConfig(
+            server_id="workspace",
+            type="local",
+            command=("python", "-m", "sandbox_agent_runtime.workspace_mcp_sidecar"),
+            timeout_ms=4321,
+        ),
+    )
+    tools = (
+        ResolvedMcpToolRef(tool_id="workspace.echo", server_id="workspace", tool_name="echo"),
+    )
+    plan = _single_plan(servers=servers, tools=tools)
+    workspace_dir = Path("/tmp/workspace-1")
+    entry_path = tmp_path / "workspace-mcp-sidecar.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        payload = {
+            "logical_server_id": "workspace",
+            "physical_server_id": "workspace__abc123",
+            "sandbox_id": "sandbox-1",
+            "url": "http://127.0.0.1:4567/mcp",
+            "timeout_ms": 4321,
+            "pid": 90210,
+            "reused": False,
+        }
+        return _FakeCliProcess(stdout_text=json.dumps(payload))
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._ts_workspace_mcp_sidecar_entry_path",
+        lambda: entry_path,
+    )
+
+    sidecar = await _start_workspace_mcp_sidecar(
+        workspace_dir=workspace_dir,
+        compiled_plan=plan,
+        workspace_id="workspace-1",
+        sandbox_id="sandbox-1",
+        physical_server_id="workspace__abc123",
+    )
+
+    assert sidecar is not None
+    assert sidecar.pid == 90210
+    assert sidecar.reused is False
+    command = captured["command"]
+    assert command[:3] == (
+        "node",
+        str(entry_path),
+        "--request-base64",
+    )
+    encoded_request = str(command[3])
+    payload = json.loads(base64.b64decode(encoded_request.encode("utf-8")).decode("utf-8"))
+    assert payload["workspace_id"] == "workspace-1"
+    assert payload["workspace_dir"] == str(workspace_dir)
+    assert payload["sandbox_id"] == "sandbox-1"
+    assert payload["physical_server_id"] == "workspace__abc123"
+    assert payload["timeout_ms"] == 4321
+    assert payload["python_executable"] == runner_module.sys.executable
+    assert payload["enabled_tool_ids_json_base64"]
+    assert payload["catalog_json_base64"]
+    assert captured["kwargs"] == {
+        "cwd": str(workspace_dir),
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_workspace_mcp_sidecar_reports_cli_failure_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    servers = (
+        ResolvedMcpServerConfig(
+            server_id="workspace",
+            type="local",
+            command=("python", "-m", "sandbox_agent_runtime.workspace_mcp_sidecar"),
+            timeout_ms=10000,
+        ),
+    )
+    tools = (
+        ResolvedMcpToolRef(tool_id="workspace.echo", server_id="workspace", tool_name="echo"),
+    )
+    plan = _single_plan(servers=servers, tools=tools)
+    entry_path = tmp_path / "workspace-mcp-sidecar.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    physical_server_id = "workspace__abc123"
+    stderr_path = _workspace_mcp_log_path(physical_server_id=physical_server_id, stream="stderr")
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.write_text("trace line\nboom\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(return_code=1)
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._ts_workspace_mcp_sidecar_entry_path",
+        lambda: entry_path,
+    )
+
+    with pytest.raises(
+        runner_module.WorkspaceRuntimeConfigError,
+        match=r"failed to start workspace MCP sidecar: .*stderr_tail=trace line\nboom",
+    ):
+        await _start_workspace_mcp_sidecar(
+            workspace_dir=Path("/tmp/workspace-1"),
+            compiled_plan=plan,
+            workspace_id="workspace-1",
+            sandbox_id="sandbox-1",
+            physical_server_id=physical_server_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_stop_workspace_mcp_sidecar_terminates_only_nonreused_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminated: list[int] = []
+    monkeypatch.setattr("sandbox_agent_runtime.runner._terminate_workspace_mcp_pid", lambda pid: terminated.append(pid))
+    monkeypatch.setattr("sandbox_agent_runtime.runner._workspace_mcp_pid_alive", lambda pid: pid > 0)
+    monkeypatch.setenv("SANDBOX_WORKSPACE_MCP_KEEP_WARM", "false")
+
+    await _stop_workspace_mcp_sidecar(
+        runner_module._RunningWorkspaceMcpSidecar(
+            logical_server_id="workspace",
+            physical_server_id="workspace__abc123",
+            sandbox_id="sandbox-1",
+            url="http://127.0.0.1:4567/mcp",
+            timeout_ms=10000,
+            pid=111,
+            reused=False,
+        )
+    )
+    await _stop_workspace_mcp_sidecar(
+        runner_module._RunningWorkspaceMcpSidecar(
+            logical_server_id="workspace",
+            physical_server_id="workspace__abc123",
+            sandbox_id="sandbox-1",
+            url="http://127.0.0.1:4567/mcp",
+            timeout_ms=10000,
+            pid=222,
+            reused=True,
+        )
+    )
+
+    assert terminated == [111]
+
+
+@pytest.mark.asyncio
+async def test_build_opencode_runtime_config_maps_workspace_tools_to_physical_server_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     tools = (
         ResolvedMcpToolRef(tool_id="workspace.read_file", server_id="workspace", tool_name="read_file"),
         ResolvedMcpToolRef(tool_id="remote.lookup", server_id="remote", tool_name="lookup"),
@@ -529,7 +1728,40 @@ def test_build_opencode_runtime_config_maps_workspace_tools_to_physical_server_i
         context=_runtime_exec_context(),
     )
 
-    config = _build_opencode_runtime_config(
+    entry_path = tmp_path / "opencode-runtime-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "provider_id": "openai",
+                    "model_id": "gpt-5.2",
+                    "mode": "code",
+                    "system_prompt": "You are concise.",
+                    "model_client": {
+                        "model_proxy_provider": "openai_compatible",
+                        "api_key": "token-1",
+                        "base_url": "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+                        "default_headers": {"X-Test": "1"},
+                    },
+                    "tools": dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True)
+                    | {"workspace__abc123_read_file": True, "remote_lookup": True},
+                    "workspace_tool_ids": ["workspace.read_file", "remote.lookup"],
+                    "workspace_skill_ids": [],
+                    "output_schema_member_id": None,
+                    "output_format": None,
+                    "workspace_config_checksum": "checksum-1",
+                }
+            )
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_runtime_config_entry_path", lambda: entry_path)
+
+    config = await _build_opencode_runtime_config(
         request=request,
         compiled_plan=plan,
         mcp_servers=(),
@@ -573,7 +1805,11 @@ def test_mcp_server_id_map_assigns_stable_workspace_physical_id() -> None:
     assert mapping_one["workspace"] != mapping_other_workspace["workspace"]
 
 
-def test_build_opencode_runtime_config_defaults_to_builtin_tools_when_no_allowlisted_mcp_tools() -> None:
+@pytest.mark.asyncio
+async def test_build_opencode_runtime_config_defaults_to_builtin_tools_when_no_allowlisted_mcp_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     plan = _single_plan(tools=())
     request = RunnerRequest(
         holaboss_user_id="user-1",
@@ -584,32 +1820,47 @@ def test_build_opencode_runtime_config_defaults_to_builtin_tools_when_no_allowli
         context=_runtime_exec_context(),
     )
 
-    config = _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=())
+    entry_path = tmp_path / "opencode-runtime-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "provider_id": "openai",
+                    "model_id": "gpt-5.2",
+                    "mode": "code",
+                    "system_prompt": "You are concise.",
+                    "model_client": {
+                        "model_proxy_provider": "openai_compatible",
+                        "api_key": "token-1",
+                        "base_url": "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+                        "default_headers": {"X-Test": "1"},
+                    },
+                    "tools": dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True),
+                    "workspace_tool_ids": [],
+                    "workspace_skill_ids": [],
+                    "output_schema_member_id": None,
+                    "output_format": None,
+                    "workspace_config_checksum": "checksum-1",
+                }
+            )
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_runtime_config_entry_path", lambda: entry_path)
+
+    config = await _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=())
     assert config.tools == dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True)
 
 
-def test_build_opencode_runtime_config_includes_workspace_skills(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.asyncio
+async def test_build_opencode_runtime_config_includes_workspace_skills(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    workspace_root = tmp_path / "workspace-root"
-    workspace_dir = workspace_root / "workspace-1"
-    skill_dir = workspace_dir / "skills" / "skill-creator"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text("# Skill Creator\nUse this skill.\n", encoding="utf-8")
-    (workspace_dir / "workspace.yaml").write_text(
-        """
-template_id: "workspace-1"
-name: "Workspace"
-skills:
-  path: "skills"
-  enabled:
-    - "skill-creator"
-""".strip()
-        + "\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr("sandbox_agent_runtime.runner.WORKSPACE_ROOT", str(workspace_root))
-
     plan = _single_plan(tools=())
     request = RunnerRequest(
         holaboss_user_id="user-1",
@@ -620,7 +1871,44 @@ skills:
         context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
     )
 
-    config = _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=())
+    entry_path = tmp_path / "opencode-runtime-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "provider_id": "openai",
+                    "model_id": "gpt-5.2",
+                    "mode": "code",
+                    "system_prompt": "You are concise.",
+                    "model_client": {
+                        "model_proxy_provider": "openai_compatible",
+                        "api_key": "token-1",
+                        "base_url": "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+                        "default_headers": {"X-Test": "1"},
+                    },
+                    "tools": dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True) | {"skill": True, "read": True},
+                    "workspace_tool_ids": [],
+                    "workspace_skill_ids": ["skill-creator"],
+                    "output_schema_member_id": None,
+                    "output_format": None,
+                    "workspace_config_checksum": "checksum-1",
+                }
+            )
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_runtime_config_entry_path", lambda: entry_path)
+
+    config = await _build_opencode_runtime_config(
+        request=request,
+        compiled_plan=plan,
+        mcp_servers=(),
+        workspace_skill_ids=("skill-creator",),
+    )
     assert config.workspace_skill_ids == ("skill-creator",)
     assert "Workspace skills are available in this run." not in config.system_prompt
     assert "skill-creator" not in config.system_prompt
@@ -628,119 +1916,177 @@ skills:
     assert config.tools["read"] is True
 
 
-def test_stage_workspace_skills_for_opencode_creates_discoverable_skill_dir(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_stage_workspace_skills_for_opencode_invokes_local_ts_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     workspace_dir = tmp_path / "workspace-1"
-    skill_dir = workspace_dir / "skills" / "skill-creator"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text("# Skill Creator\n", encoding="utf-8")
-    (workspace_dir / "workspace.yaml").write_text(
-        """
-template_id: "workspace-1"
-name: "Workspace"
-skills:
-  path: "skills"
-  enabled:
-    - "skill-creator"
-""".strip()
-        + "\n",
-        encoding="utf-8",
-    )
+    entry_path = tmp_path / "opencode-skills.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    captured: dict[str, object] = {}
 
-    workspace_skills = runner_module._resolve_workspace_skills(workspace_dir=workspace_dir)
-    assert workspace_skills is not None
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return _FakeCliProcess(stdout_text=json.dumps({"changed": True, "skill_ids": ["skill-creator"]}))
 
-    changed = runner_module._stage_workspace_skills_for_opencode(
-        workspace_dir=workspace_dir,
-        workspace_skills=workspace_skills,
-    )
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_skills_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner.WORKSPACE_ROOT", str(tmp_path / "runtime-root"))
+
+    changed, skill_ids = await runner_module._stage_workspace_skills_for_opencode(workspace_dir=workspace_dir)
     assert changed is True
+    assert skill_ids == ("skill-creator",)
+    command = captured["command"]
+    assert command[:3] == ("node", str(entry_path), "--request-base64")
+    payload = json.loads(base64.b64decode(str(command[3])).decode("utf-8"))
+    assert payload == {
+        "workspace_dir": str(workspace_dir),
+        "runtime_root": str(Path(runner_module.WORKSPACE_ROOT)),
+    }
+    assert captured["kwargs"] == {
+        "cwd": str(workspace_dir),
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
 
-    staged_skill = workspace_dir / ".opencode" / "skills" / "skill-creator" / "SKILL.md"
-    assert staged_skill.is_file()
-    assert "Skill Creator" in staged_skill.read_text(encoding="utf-8")
-    runtime_staged_skill = Path(runner_module.WORKSPACE_ROOT) / ".opencode" / "skills" / "skill-creator" / "SKILL.md"
-    assert runtime_staged_skill.is_file()
 
-
-def test_stage_workspace_skills_for_opencode_is_noop_when_manifest_matches(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_stage_workspace_skills_for_opencode_is_noop_when_cli_reports_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     workspace_dir = tmp_path / "workspace-1"
-    skill_dir = workspace_dir / "skills" / "skill-creator"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text("# Skill Creator\n", encoding="utf-8")
-    (workspace_dir / "workspace.yaml").write_text(
-        """
-template_id: "workspace-1"
-name: "Workspace"
-skills:
-  path: "skills"
-  enabled:
-    - "skill-creator"
-""".strip()
-        + "\n",
-        encoding="utf-8",
-    )
+    entry_path = tmp_path / "opencode-skills.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
 
-    workspace_skills = runner_module._resolve_workspace_skills(workspace_dir=workspace_dir)
-    assert workspace_skills is not None
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(stdout_text=json.dumps({"changed": False, "skill_ids": []}))
 
-    first_changed = runner_module._stage_workspace_skills_for_opencode(
-        workspace_dir=workspace_dir,
-        workspace_skills=workspace_skills,
-    )
-    second_changed = runner_module._stage_workspace_skills_for_opencode(
-        workspace_dir=workspace_dir,
-        workspace_skills=workspace_skills,
-    )
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_skills_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner.WORKSPACE_ROOT", str(tmp_path / "runtime-root"))
 
-    assert first_changed is True
-    assert second_changed is False
-    runtime_staged_skill = Path(runner_module.WORKSPACE_ROOT) / ".opencode" / "skills" / "skill-creator" / "SKILL.md"
-    assert "Skill Creator" in runtime_staged_skill.read_text(encoding="utf-8")
+    changed, skill_ids = await runner_module._stage_workspace_skills_for_opencode(workspace_dir=workspace_dir)
+    assert changed is False
+    assert skill_ids == ()
 
 
-def test_stage_workspace_commands_for_opencode_creates_discoverable_commands_dir(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_stage_workspace_skills_for_opencode_returns_false_without_workspace_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_dir = tmp_path / "workspace-1"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    entry_path = tmp_path / "opencode-skills.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(stdout_text=json.dumps({"changed": False, "skill_ids": []}))
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_skills_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner.WORKSPACE_ROOT", str(tmp_path / "runtime-root"))
+
+    changed, skill_ids = await runner_module._stage_workspace_skills_for_opencode(workspace_dir=workspace_dir)
+
+    assert changed is False
+    assert skill_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_stage_workspace_skills_for_opencode_raises_on_cli_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_dir = tmp_path / "workspace-1"
+    entry_path = tmp_path / "opencode-skills.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(return_code=1, stderr_text="skills failed")
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_skills_entry_path", lambda: entry_path)
+    monkeypatch.setattr("sandbox_agent_runtime.runner.WORKSPACE_ROOT", str(tmp_path / "runtime-root"))
+
+    with pytest.raises(RuntimeError, match="skills failed"):
+        await runner_module._stage_workspace_skills_for_opencode(workspace_dir=workspace_dir)
+
+
+@pytest.mark.asyncio
+async def test_stage_workspace_commands_for_opencode_invokes_local_ts_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     workspace_dir = tmp_path / "workspace-1"
     commands_dir = workspace_dir / "commands"
     commands_dir.mkdir(parents=True, exist_ok=True)
     (commands_dir / "hello.md").write_text("---\ndescription: Hello\n---\nEcho hello.\n", encoding="utf-8")
 
-    runner_module._stage_workspace_commands_for_opencode(workspace_dir=workspace_dir)
+    entry_path = tmp_path / "opencode-commands.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+    captured_command: tuple[str, ...] | None = None
+    captured_cwd: str | None = None
 
-    staged_command = workspace_dir / ".opencode" / "commands" / "hello.md"
-    assert staged_command.is_file()
-    assert "Echo hello" in staged_command.read_text(encoding="utf-8")
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        nonlocal captured_command, captured_cwd
+        captured_command = tuple(str(item) for item in command)
+        captured_cwd = str(kwargs.get("cwd"))
+        return _FakeCliProcess(stdout_text='{"changed": true}')
 
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_commands_entry_path", lambda: entry_path)
 
-@pytest.fixture(autouse=True)
-def _noop_opencode_mcp_registration(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _noop(*, client, mcp_servers):
-        del client, mcp_servers
-        return None
+    changed = await runner_module._stage_workspace_commands_for_opencode(workspace_dir=workspace_dir)
 
-    async def _noop_session_exists(*, client, session_id):
-        del client, session_id
-        return True
-
-    async def _noop_restart(**kwargs) -> None:
-        del kwargs
-        return None
-
-    def _noop_write_provider_config(*, provider_id, model_id, model_client_config):
-        del provider_id, model_id, model_client_config
-        return Path("opencode.json"), False
-
-    def _noop_write_model_selection(*, provider_id, model_id):
-        del provider_id, model_id
-        return Path("opencode.json"), False
-
-    monkeypatch.setattr("sandbox_agent_runtime.runner._ensure_opencode_mcp_servers", _noop)
-    monkeypatch.setattr("sandbox_agent_runtime.runner._write_opencode_provider_config", _noop_write_provider_config)
-    monkeypatch.setattr("sandbox_agent_runtime.runner._write_opencode_model_selection", _noop_write_model_selection)
-    monkeypatch.setattr("sandbox_agent_runtime.runner._opencode_session_exists", _noop_session_exists)
-    monkeypatch.setattr("sandbox_agent_runtime.runner._restart_opencode_sidecar", _noop_restart)
+    assert changed is True
+    assert captured_command is not None
+    assert captured_command[:3] == ("node", str(entry_path), "--request-base64")
+    assert captured_cwd == str(workspace_dir)
+    payload = json.loads(base64.b64decode(captured_command[3]).decode("utf-8"))
+    assert payload == {"workspace_dir": str(workspace_dir)}
 
 
-def test_build_opencode_runtime_config_preserves_mcp_server_payloads() -> None:
+@pytest.mark.asyncio
+async def test_stage_workspace_commands_for_opencode_raises_on_cli_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_dir = tmp_path / "workspace-1"
+    commands_dir = workspace_dir / "commands"
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    (commands_dir / "hello.md").write_text("---\ndescription: Hello\n---\nEcho hello.\n", encoding="utf-8")
+
+    entry_path = tmp_path / "opencode-commands.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(return_code=1, stderr_text="commands failed")
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_commands_entry_path", lambda: entry_path)
+
+    with pytest.raises(RuntimeError, match="commands failed"):
+        await runner_module._stage_workspace_commands_for_opencode(workspace_dir=workspace_dir)
+
+@pytest.mark.asyncio
+async def test_build_opencode_runtime_config_preserves_mcp_server_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     tools = (ResolvedMcpToolRef(tool_id="workspace.lookup", server_id="workspace", tool_name="lookup"),)
     plan = _single_plan(tools=tools)
     mcp_servers = (
@@ -758,68 +2104,40 @@ def test_build_opencode_runtime_config_preserves_mcp_server_payloads() -> None:
         context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
     )
 
-    config = _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=mcp_servers)
+    entry_path = tmp_path / "opencode-runtime-config.mjs"
+    entry_path.write_text("// test entry\n", encoding="utf-8")
+
+    async def _fake_create_subprocess_exec(*command, **kwargs):
+        del command, kwargs
+        return _FakeCliProcess(
+            stdout_text=json.dumps(
+                {
+                    "provider_id": "openai",
+                    "model_id": "gpt-5.2",
+                    "mode": "code",
+                    "system_prompt": "You are concise.",
+                    "model_client": {
+                        "model_proxy_provider": "openai_compatible",
+                        "api_key": "token-1",
+                        "base_url": "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1",
+                        "default_headers": {"X-Test": "1"},
+                    },
+                    "tools": dict.fromkeys(runner_module._OPENCODE_DEFAULT_TOOLS, True) | {"workspace_lookup": True},
+                    "workspace_tool_ids": ["workspace.lookup"],
+                    "workspace_skill_ids": [],
+                    "output_schema_member_id": None,
+                    "output_format": None,
+                    "workspace_config_checksum": "checksum-1",
+                }
+            )
+        )
+
+    monkeypatch.setattr("sandbox_agent_runtime.runner.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_harness_host_node_bin", lambda: "node")
+    monkeypatch.setattr("sandbox_agent_runtime.runner._ts_opencode_runtime_config_entry_path", lambda: entry_path)
+
+    config = await _build_opencode_runtime_config(request=request, compiled_plan=plan, mcp_servers=mcp_servers)
     assert config.mcp_servers == mcp_servers
-
-
-def test_opencode_provider_config_payload_uses_model_proxy_headers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SANDBOX_MODEL_PROXY_ENABLE_DIRECT_OPENAI_FALLBACK", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(run_id="run-ctx-1", model_proxy_api_key="hbrt.v1.proxy-user-key"),
-    )
-
-    model_client_config = _resolve_model_client_config(request=request, model_proxy_provider="openai_compatible")
-    payload = _opencode_provider_config_payload(
-        provider_id="holaboss_proxy",
-        model_id="gpt-5.1",
-        model_client_config=model_client_config,
-    )
-
-    assert payload["model"] == "holaboss_proxy/gpt-5.1"
-    provider = payload["provider"]["holaboss_proxy"]
-    assert provider["npm"] == "@ai-sdk/openai-compatible"
-    assert provider["options"]["baseURL"] == "http://sandbox-runtime:3060/api/v1/model-proxy/openai/v1"
-    assert provider["options"]["apiKey"] == "hbrt.v1.proxy-user-key"
-    assert provider["options"]["headers"]["X-API-Key"] == "hbrt.v1.proxy-user-key"
-    assert provider["options"]["headers"]["X-Holaboss-Sandbox-Id"] == "sandbox-1"
-    assert "X-Holaboss-Run-Id" not in provider["options"]["headers"]
-
-
-def test_opencode_provider_config_payload_uses_anthropic_provider_package(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SANDBOX_MODEL_PROXY_ENABLE_DIRECT_OPENAI_FALLBACK", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(run_id="run-ctx-1", model_proxy_api_key="hbrt.v1.proxy-user-key"),
-    )
-
-    model_client_config = _resolve_model_client_config(
-        request=request,
-        model_proxy_provider="anthropic_native",
-        harness="opencode",
-    )
-    payload = _opencode_provider_config_payload(
-        provider_id="anthropic",
-        model_id="claude-3-7-sonnet-20250219",
-        model_client_config=model_client_config,
-    )
-
-    provider = payload["provider"]["anthropic"]
-    assert provider["npm"] == "@ai-sdk/anthropic"
-    assert provider["options"]["baseURL"] == "http://sandbox-runtime:3060/api/v1/model-proxy/anthropic/v1"
-
 
 def test_resolve_model_client_config_requires_sandbox_model_proxy_base_url(
     monkeypatch: pytest.MonkeyPatch,
@@ -1220,83 +2538,78 @@ def test_should_emit_opencode_event_filters_step_markers_and_prompt_echo() -> No
 
 
 @pytest.mark.asyncio
-async def test_execute_request_opencode_harness_streams_and_completes(
+async def test_execute_request_opencode_delegates_to_harness_host(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
 
+    async def _noop_restart(**kwargs) -> None:
+        del kwargs
+        return None
+
+    async def _noop_write_opencode_config_via_local_ts(*, provider_id, model_id, model_client_config):
+        del provider_id, model_id, model_client_config
+        return Path("opencode.json"), False, False
+
+    async def _noop_stage_workspace_commands_for_opencode(*, workspace_dir):
+        del workspace_dir
+        return False
+
     async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
         del workspace_dir, workspace_id
         return object()
 
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
+    async def _fake_build_opencode_runtime_config(
+        *, request, compiled_plan, mcp_servers, workspace_skill_ids=(), tool_server_id_map=None
+    ):
+        del request, compiled_plan, mcp_servers, workspace_skill_ids, tool_server_id_map
         return SimpleNamespace(
             provider_id="openai",
             model_id="gpt-5.2",
             mode="code",
             system_prompt="You are concise.",
+            model_client_config=_model_client_config_fixture(),
             tools={"read": True},
             mcp_servers=(),
+            workspace_tool_ids=(),
+            workspace_skill_ids=(),
+            output_schema_member_id=None,
+            output_schema_model=None,
+            output_format=None,
             workspace_config_checksum="checksum-1",
         )
 
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
+    captured: dict[str, object] = {}
 
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.chat_kwargs: list[dict[str, object]] = []
-
-        async def create(self, *, extra_body=None):
-            return SimpleNamespace(id="opencode-session-1", extra_body=extra_body)
-
-        async def chat(self, **kwargs):
-            self.chat_kwargs.append(kwargs)
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeEvent:
-        async def list(self):
-            part = SimpleNamespace(type="text", id="part-1", text="Hello world", session_id="opencode-session-1")
-            events = [
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-session-1", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="opencode-session-1",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ]
-            return _FakeStream(events)
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.session = _FakeSession()
-            self.event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
+    async def _fake_try_execute_request_opencode_via_harness_host(
+        *, request, workspace_dir, runtime_config, model_client_config, mcp_server_id_map, sidecar, push_client
+    ) -> bool:
+        del model_client_config, mcp_server_id_map, sidecar
+        captured["workspace_id"] = request.workspace_id
+        captured["workspace_dir"] = str(workspace_dir)
+        captured["model_id"] = runtime_config.model_id
+        await runner_module._emit_event_with_push(
+            event=runner_module.RunnerOutputEvent(
+                session_id=request.session_id,
+                input_id=request.input_id,
+                sequence=2,
+                event_type="run_started",
+                payload={"provider_id": "openai", "model_id": runtime_config.model_id},
+            ),
+            push_client=push_client,
+        )
+        await runner_module._emit_event_with_push(
+            event=runner_module.RunnerOutputEvent(
+                session_id=request.session_id,
+                input_id=request.input_id,
+                sequence=3,
+                event_type="run_completed",
+                payload={"status": "success", "harness_session_id": "host-session-1"},
+            ),
+            push_client=push_client,
+        )
+        return True
 
     monkeypatch.setattr(
         "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
@@ -1306,10 +2619,19 @@ async def test_execute_request_opencode_harness_streams_and_completes(
         "sandbox_agent_runtime.runner._build_opencode_runtime_config",
         _fake_build_opencode_runtime_config,
     )
-    fake_client = _FakeClient()
+    monkeypatch.setattr("sandbox_agent_runtime.runner._write_opencode_config_via_local_ts", _noop_write_opencode_config_via_local_ts)
     monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: fake_client,
+        "sandbox_agent_runtime.runner._stage_workspace_skills_for_opencode",
+        lambda *, workspace_dir: asyncio.sleep(0, result=(False, ())),
+    )
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._stage_workspace_commands_for_opencode",
+        _noop_stage_workspace_commands_for_opencode,
+    )
+    monkeypatch.setattr("sandbox_agent_runtime.runner._restart_opencode_sidecar", _noop_restart)
+    monkeypatch.setattr(
+        "sandbox_agent_runtime.runner._try_execute_request_opencode_via_harness_host",
+        _fake_try_execute_request_opencode_via_harness_host,
     )
 
     request = RunnerRequest(
@@ -1325,580 +2647,10 @@ async def test_execute_request_opencode_harness_streams_and_completes(
 
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip() and line.lstrip().startswith("{")]
     events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "output_delta", "run_completed"]
-    assert events[1]["payload"]["provider_id"] == "openai"
-    assert events[2]["payload"]["delta"] == "Hello world"
-    assert events[3]["payload"]["status"] == "success"
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_harness_does_not_cancel_stream_reads_between_poll_ticks(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _CancellationSensitiveStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-            self.cancelled = False
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if self.cancelled or not self._events:
-                raise StopAsyncIteration
-            try:
-                await asyncio.sleep(1.2)
-            except asyncio.CancelledError:
-                self.cancelled = True
-                raise
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        async def chat(self, **kwargs):
-            del kwargs
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeEvent:
-        async def list(self):
-            part = SimpleNamespace(type="text", id="part-1", text="Hello world", session_id="opencode-session-1")
-            events = [
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-session-1", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="opencode-session-1",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ]
-            return _CancellationSensitiveStream(events)
-
-    class _FakeClient:
-        session = _FakeSession()
-        event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: _FakeClient(),
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
-    )
-    exit_code = await _execute_request(request)
-    assert exit_code == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip() and line.lstrip().startswith("{")]
-    events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "output_delta", "run_completed"]
-    assert events[2]["payload"]["delta"] == "Hello world"
-    assert events[3]["payload"]["status"] == "success"
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_harness_completes_when_question_tool_requests_user_input(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"question": True},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        async def chat(self, **kwargs):
-            del kwargs
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeEvent:
-        async def list(self):
-            question_part = SimpleNamespace(
-                type="tool",
-                id="tool-part-1",
-                tool="question",
-                call_id="call-1",
-                state=SimpleNamespace(
-                    status="running",
-                    input={
-                        "questions": [
-                            {
-                                "question": "What are your top 1-3 outcomes?",
-                                "header": "Top Outcomes",
-                            }
-                        ]
-                    },
-                    output=None,
-                    error=None,
-                ),
-                session_id="opencode-session-1",
-            )
-            return _FakeStream([
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-session-1", part=question_part),
-                )
-            ])
-
-    class _FakeClient:
-        session = _FakeSession()
-        event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: _FakeClient(),
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
-    )
-    exit_code = await _execute_request(request)
-    assert exit_code == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip() and line.lstrip().startswith("{")]
-    events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "tool_call", "run_completed"]
-    assert events[2]["payload"]["tool_name"] == "question"
-    assert events[3]["payload"]["status"] == "waiting_user"
-    assert events[3]["payload"]["interaction_type"] == "question"
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_harness_fails_fast_when_chat_errors(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-4o-mini",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _HangingStream:
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            await asyncio.sleep(3600)
-            raise StopAsyncIteration
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        async def chat(self, **kwargs):
-            del kwargs
-            raise json.JSONDecodeError("Expecting value", "", 0)
-
-    class _FakeEvent:
-        async def list(self):
-            return _HangingStream()
-
-    class _FakeClient:
-        session = _FakeSession()
-        event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: _FakeClient(),
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
-    )
-    exit_code = await _execute_request(request)
-    assert exit_code == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "run_failed"]
-    assert "OpenCode chat request failed" in events[-1]["payload"]["message"]
-    assert "Expecting value" in events[-1]["payload"]["message"]
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_harness_schema_validation_failure(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    class _StructuredOutput(BaseModel):
-        steps: list[str]
-
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_tool_ids=("read",),
-            output_schema_member_id="workspace.general",
-            output_schema_model=_StructuredOutput,
-            output_format={"type": "json_schema", "schema": {"type": "object"}, "retryCount": 2},
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.chat_kwargs: list[dict[str, object]] = []
-
-        async def create(self, *, extra_body=None):
-            return SimpleNamespace(id="opencode-session-1", extra_body=extra_body)
-
-        async def chat(self, **kwargs):
-            self.chat_kwargs.append(kwargs)
-            return SimpleNamespace(id="msg-1")
-
-        async def messages(self, session_id: str):
-            del session_id
-            return [
-                SimpleNamespace(
-                    info=SimpleNamespace(role="assistant"),
-                    parts=[SimpleNamespace(type="text", text="not-json")],
-                )
-            ]
-
-    class _FakeEvent:
-        async def list(self):
-            part = SimpleNamespace(type="text", id="part-1", text="not-json", session_id="opencode-session-1")
-            return _FakeStream([
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-session-1", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="opencode-session-1",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ])
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.session = _FakeSession()
-            self.event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: fake_client,
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
-    )
-    exit_code = await _execute_request(request)
-    assert exit_code == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "output_delta", "run_failed"]
-    assert events[-1]["payload"]["type"] == "StructuredOutputValidationError"
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_harness_schema_validation_success(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    class _StructuredOutput(BaseModel):
-        steps: list[str]
-
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_tool_ids=("read",),
-            output_schema_member_id="workspace.general",
-            output_schema_model=_StructuredOutput,
-            output_format={"type": "json_schema", "schema": {"type": "object"}, "retryCount": 2},
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.chat_kwargs: list[dict[str, object]] = []
-
-        async def create(self, *, extra_body=None):
-            return SimpleNamespace(id="opencode-session-1", extra_body=extra_body)
-
-        async def chat(self, **kwargs):
-            self.chat_kwargs.append(kwargs)
-            return SimpleNamespace(id="msg-1")
-
-        async def messages(self, session_id: str):
-            del session_id
-            return [
-                SimpleNamespace(
-                    info=SimpleNamespace(role="assistant"),
-                    parts=[SimpleNamespace(type="text", text='{"steps":["check readiness","add /healthz"]}')],
-                )
-            ]
-
-    class _FakeEvent:
-        async def list(self):
-            part = SimpleNamespace(
-                type="text",
-                id="part-1",
-                text='{"steps":["check readiness","add /healthz"]}',
-                session_id="opencode-session-1",
-            )
-            return _FakeStream([
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-session-1", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="opencode-session-1",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ])
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.session = _FakeSession()
-            self.event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: fake_client,
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
-    )
-    exit_code = await _execute_request(request)
-    assert exit_code == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "output_delta", "run_completed"]
-    completed_payload = events[-1]["payload"]
-    assert completed_payload["schema_member_id"] == "workspace.general"
-    assert completed_payload["structured_output"] == {"steps": ["check readiness", "add /healthz"]}
-    assert fake_client.session.chat_kwargs
-    chat_call = fake_client.session.chat_kwargs[0]
-    assert "extra_body" in chat_call
-    assert chat_call["extra_body"] == {"format": {"type": "json_schema", "schema": {"type": "object"}, "retryCount": 2}}
+    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "run_completed"]
+    assert captured["workspace_id"] == "workspace-1"
+    assert str(captured["workspace_dir"]).endswith("workspace-root/workspace-1")
+    assert captured["model_id"] == "gpt-5.2"
 
 
 @pytest.mark.asyncio
@@ -1924,506 +2676,3 @@ async def test_execute_request_run_failed_when_harness_value_invalid(
     event = json.loads(lines[-1])
     assert event["event_type"] == "run_failed"
     assert "SANDBOX_AGENT_HARNESS='invalid-harness'" in event["payload"]["message"]
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_harness_enriches_session_error(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _ErrorStream:
-        def __init__(self) -> None:
-            error = SimpleNamespace(
-                name="APIError",
-                data={
-                    "message": "quota exceeded",
-                    "status": 429,
-                    "code": "insufficient_quota",
-                    "providerID": "openai",
-                },
-            )
-            self._events = [
-                SimpleNamespace(
-                    type="session.error",
-                    properties=SimpleNamespace(session_id="opencode-session-1", error=error),
-                )
-            ]
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        async def create(self, *, extra_body=None):
-            return SimpleNamespace(id="opencode-session-1", extra_body=extra_body)
-
-        async def chat(self, **kwargs):
-            del kwargs
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeEvent:
-        async def list(self):
-            return _ErrorStream()
-
-    class _FakeClient:
-        session = _FakeSession()
-        event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: _FakeClient(),
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-session-1"),
-    )
-    exit_code = await _execute_request(request)
-    assert exit_code == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    events = [json.loads(line) for line in lines]
-    assert [event["event_type"] for event in events] == ["run_claimed", "run_started", "run_failed"]
-    failed = events[-1]["payload"]
-    assert failed["error_name"] == "APIError"
-    assert failed["status_code"] == 429
-    assert failed["error_code"] == "insufficient_quota"
-    assert failed["provider_id"] == "openai"
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_uses_runtime_context_harness_session_id(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.chat_session_ids: list[str] = []
-
-        async def chat(self, **kwargs):
-            self.chat_session_ids.append(str(kwargs.get("id")))
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeEvent:
-        async def list(self):
-            part = SimpleNamespace(type="text", id="part-1", text="Hello world", session_id="opencode-main-1")
-            events = [
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-main-1", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="opencode-main-1",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ]
-            return _FakeStream(events)
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.session = _FakeSession()
-            self.event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: fake_client,
-    )
-
-    request_first = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-main-1"),
-    )
-    request_second = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-2",
-        input_id="input-2",
-        instruction="hello again",
-        context=_runtime_exec_context(
-            run_id="run-2",
-            model_proxy_api_key="hbrt.v1.run-token-2",
-            harness="opencode",
-            harness_session_id="opencode-main-1",
-        ),
-    )
-
-    exit_code_first = await _execute_request(request_first)
-    assert exit_code_first == 0
-    capsys.readouterr()
-
-    exit_code_second = await _execute_request(request_second)
-    assert exit_code_second == 0
-
-    assert fake_client.session.chat_session_ids == ["opencode-main-1", "opencode-main-1"]
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_replaces_harness_session_when_not_found(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.chat_session_ids: list[str] = []
-
-        async def chat(self, **kwargs):
-            self.chat_session_ids.append(str(kwargs.get("id")))
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeEvent:
-        def __init__(self) -> None:
-            self.list_calls = 0
-
-        async def list(self):
-            self.list_calls += 1
-            part = SimpleNamespace(type="text", id="part-1", text="Hello world", session_id="unexpected-session")
-            return _FakeStream([
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="unexpected-session", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="unexpected-session",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ])
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.session = _FakeSession()
-            self.event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    created_ids: list[str] = []
-
-    async def _fake_opencode_create_session() -> str:
-        created_ids.append("unexpected-session")
-        return "unexpected-session"
-
-    async def _fake_opencode_session_exists(*, client, session_id):
-        del client, session_id
-        return False
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_create_session",
-        _fake_opencode_create_session,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_session_exists",
-        _fake_opencode_session_exists,
-    )
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: fake_client,
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-stale-1"),
-    )
-    assert await _execute_request(request) == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip() and line.lstrip().startswith("{")]
-    events = [json.loads(line) for line in lines]
-    assert events[0]["event_type"] == "run_claimed"
-    assert events[1]["event_type"] == "run_started"
-    assert events[-1]["event_type"] == "run_completed"
-    assert created_ids == ["unexpected-session"]
-    assert fake_client.session.chat_session_ids == ["unexpected-session"]
-    assert fake_client.event.list_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_execute_request_opencode_model_selection_change_preserves_harness_session(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setenv("SANDBOX_AGENT_HARNESS", "opencode")
-
-    async def _fake_compile_workspace_runtime_plan(*, workspace_dir, workspace_id):
-        del workspace_dir, workspace_id
-        return object()
-
-    def _fake_build_opencode_runtime_config(*, request, compiled_plan, mcp_servers, tool_server_id_map=None):
-        del request, compiled_plan, mcp_servers, tool_server_id_map
-        return SimpleNamespace(
-            provider_id="openai",
-            model_id="gpt-5.2",
-            mode="code",
-            system_prompt="You are concise.",
-            tools={"read": True},
-            mcp_servers=(),
-            workspace_config_checksum="checksum-1",
-        )
-
-    class _FakeStream:
-        def __init__(self, events: list[object]) -> None:
-            self._events = list(events)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self._events:
-                raise StopAsyncIteration
-            return self._events.pop(0)
-
-        async def aclose(self) -> None:
-            return None
-
-    class _FakeSession:
-        def __init__(self) -> None:
-            self.chat_session_ids: list[str] = []
-
-        async def chat(self, **kwargs):
-            self.chat_session_ids.append(str(kwargs.get("id")))
-            return SimpleNamespace(id="msg-1")
-
-    class _FakeEvent:
-        def __init__(self) -> None:
-            self.list_calls = 0
-
-        async def list(self):
-            self.list_calls += 1
-            part = SimpleNamespace(type="text", id="part-1", text="Hello world", session_id="opencode-stale-1")
-            return _FakeStream([
-                SimpleNamespace(
-                    type="message.part.updated",
-                    properties=SimpleNamespace(session_id="opencode-stale-1", part=part),
-                ),
-                SimpleNamespace(
-                    type="session.status",
-                    properties=SimpleNamespace(
-                        session_id="opencode-stale-1",
-                        status=SimpleNamespace(type="idle"),
-                    ),
-                ),
-            ])
-
-    class _FakeClient:
-        def __init__(self) -> None:
-            self.session = _FakeSession()
-            self.event = _FakeEvent()
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    model_selection_writes: list[bool] = [True]
-    created_ids: list[str] = []
-
-    def _fake_write_model_selection(*, provider_id, model_id):
-        del provider_id, model_id
-        changed = model_selection_writes.pop(0) if model_selection_writes else False
-        return Path("opencode.json"), changed
-
-    async def _fake_opencode_create_session() -> str:
-        created_ids.append("unexpected-session")
-        return "unexpected-session"
-
-    async def _fake_opencode_session_exists(*, client, session_id):
-        del client, session_id
-        return True
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._compile_workspace_runtime_plan",
-        _fake_compile_workspace_runtime_plan,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._build_opencode_runtime_config",
-        _fake_build_opencode_runtime_config,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._write_opencode_model_selection",
-        _fake_write_model_selection,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_create_session",
-        _fake_opencode_create_session,
-    )
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_session_exists",
-        _fake_opencode_session_exists,
-    )
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.runner._opencode_client_factory",
-        lambda *, base_url: fake_client,
-    )
-
-    request = RunnerRequest(
-        holaboss_user_id="user-1",
-        workspace_id="workspace-1",
-        session_id="session-1",
-        input_id="input-1",
-        instruction="hello",
-        context=_runtime_exec_context(harness="opencode", harness_session_id="opencode-stale-1"),
-    )
-    assert await _execute_request(request) == 0
-
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip() and line.lstrip().startswith("{")]
-    events = [json.loads(line) for line in lines]
-    assert events[0]["event_type"] == "run_claimed"
-    assert events[1]["event_type"] == "run_started"
-    assert events[-1]["event_type"] == "run_completed"
-    assert created_ids == []
-    assert fake_client.session.chat_session_ids == ["opencode-stale-1"]
-    assert fake_client.event.list_calls == 1

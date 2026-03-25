@@ -6,22 +6,17 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
 from httpx import ASGITransport, AsyncClient
+from fastapi.responses import Response, StreamingResponse
 from sandbox_agent_runtime import api as api_module
 from sandbox_agent_runtime.api import app
 from sandbox_agent_runtime.runtime_local_state import (
-    append_output_event,
-    claim_inputs,
     create_workspace,
-    enqueue_input,
     get_input,
-    insert_session_message,
     list_runtime_states,
-    upsert_binding,
 )
 
 _APP_RUNTIME_YAML = """\
@@ -41,34 +36,49 @@ mcp:
 
 
 @pytest.mark.asyncio
-async def test_run_endpoint_returns_runner_events(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _fake_execute_runner_request(request, on_event=None):
-        del request, on_event
-        events = [
-            api_module.RunnerOutputEvent(
-                session_id="session-1",
-                input_id="input-1",
-                sequence=1,
-                event_type="run_started",
-                payload={"instruction_preview": "hello"},
-            ),
-            api_module.RunnerOutputEvent(
-                session_id="session-1",
-                input_id="input-1",
-                sequence=2,
-                event_type="run_completed",
-                payload={"status": "success"},
-            ),
-        ]
-        return api_module._RunnerExecutionResult(
-            events=events,
-            skipped_lines=[],
-            stderr="",
-            return_code=0,
-            saw_terminal=True,
+async def test_runner_routes_proxy_to_ts_api_when_enabled(monkeypatch: pytest.MonkeyPatch, runtime_db_env: Path) -> None:
+    del runtime_db_env
+
+    captured_json: list[dict[str, object]] = []
+    captured_stream: list[dict[str, object]] = []
+
+    async def _fake_proxy_json(method: str, path: str, *, params=None, json_body=None):
+        captured_json.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({
+                "session_id": "session-1",
+                "input_id": "input-1",
+                "events": [
+                    {"session_id": "session-1", "input_id": "input-1", "sequence": 1, "event_type": "run_started", "payload": {"instruction_preview": "hello"}},
+                    {"session_id": "session-1", "input_id": "input-1", "sequence": 2, "event_type": "run_completed", "payload": {"status": "success"}},
+                ],
+            }).encode("utf-8"),
+            media_type="application/json",
         )
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._execute_runner_request", _fake_execute_runner_request)
+    async def _fake_proxy_stream(path: str, *, method="GET", params=None, json_body=None):
+        captured_stream.append({
+            "path": path,
+            "method": method,
+            "params": params,
+            "json_body": json_body,
+        })
+        return StreamingResponse(
+            iter([
+                b"event: run_started\nid: input-1:1\ndata: {\"session_id\":\"session-1\",\"input_id\":\"input-1\",\"sequence\":1,\"event_type\":\"run_started\",\"payload\":{\"instruction_preview\":\"hello\"}}\n\n",
+                b"event: run_completed\nid: input-1:2\ndata: {\"session_id\":\"session-1\",\"input_id\":\"input-1\",\"sequence\":2,\"event_type\":\"run_completed\",\"payload\":{\"status\":\"success\"}}\n\n",
+            ]),
+            media_type="text/event-stream",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy_json)
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_stream", _fake_proxy_stream)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -82,66 +92,7 @@ async def test_run_endpoint_returns_runner_events(monkeypatch: pytest.MonkeyPatc
                 "context": {},
             },
         )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert [event["event_type"] for event in payload["events"]] == ["run_started", "run_completed"]
-
-
-@pytest.mark.asyncio
-async def test_stream_endpoint_emits_sse_events(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _FakePipe:
-        def __init__(self, lines: list[bytes]) -> None:
-            self._lines = list(lines)
-
-        async def readline(self) -> bytes:
-            if self._lines:
-                return self._lines.pop(0)
-            return b""
-
-        async def read(self) -> bytes:
-            return b""
-
-    class _FakeProcess:
-        def __init__(self) -> None:
-            self.returncode: int | None = None
-            self.stdout = _FakePipe([
-                json.dumps({
-                    "session_id": "session-1",
-                    "input_id": "input-1",
-                    "sequence": 1,
-                    "event_type": "run_started",
-                    "payload": {"instruction_preview": "hello"},
-                }).encode("utf-8")
-                + b"\n",
-                json.dumps({
-                    "session_id": "session-1",
-                    "input_id": "input-1",
-                    "sequence": 2,
-                    "event_type": "run_completed",
-                    "payload": {"status": "success"},
-                }).encode("utf-8")
-                + b"\n",
-            ])
-            self.stderr = _FakePipe([])
-
-        async def wait(self) -> int:
-            self.returncode = 0
-            return 0
-
-        def kill(self) -> None:
-            self.returncode = -9
-
-    async def _fake_create_subprocess_exec(*args, **kwargs) -> _FakeProcess:
-        del args, kwargs
-        return _FakeProcess()
-
-    monkeypatch.setattr("sandbox_agent_runtime.api.asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
-
-    transport = ASGITransport(app=app)
-    async with (
-        AsyncClient(transport=transport, base_url="http://test") as client,
-        client.stream(
+        async with client.stream(
             "POST",
             "/api/v1/agent-runs/stream",
             json={
@@ -151,31 +102,153 @@ async def test_stream_endpoint_emits_sse_events(monkeypatch: pytest.MonkeyPatch)
                 "instruction": "hello",
                 "context": {},
             },
-        ) as response,
-    ):
-        assert response.status_code == 200
-        body = await response.aread()
-        text = body.decode("utf-8", errors="replace")
+        ) as stream_response:
+            body = await stream_response.aread()
 
+    assert response.status_code == 200
+    assert [event["event_type"] for event in response.json()["events"]] == ["run_started", "run_completed"]
+    text = body.decode("utf-8", errors="replace")
     assert "event: run_started" in text
     assert "event: run_completed" in text
+    assert captured_json == [{
+        "method": "POST",
+        "path": "/api/v1/agent-runs",
+        "params": None,
+        "json_body": {
+            "holaboss_user_id": None,
+            "workspace_id": "workspace-1",
+            "session_id": "session-1",
+            "input_id": "input-1",
+            "instruction": "hello",
+            "context": {},
+            "model": None,
+            "debug": False,
+        },
+    }]
+    assert captured_stream == [{
+        "path": "/api/v1/agent-runs/stream",
+        "method": "POST",
+        "params": None,
+        "json_body": {
+            "holaboss_user_id": None,
+            "workspace_id": "workspace-1",
+            "session_id": "session-1",
+            "input_id": "input-1",
+            "instruction": "hello",
+            "context": {},
+            "model": None,
+            "debug": False,
+        },
+    }]
 
 
 @pytest.mark.asyncio
-async def test_memory_search_endpoint_uses_shared_operations(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.api.memory_search",
-        lambda *, workspace_id, query, max_results, min_score: {
-            "workspace_id": workspace_id,
-            "query": query,
-            "max_results": max_results,
-            "min_score": min_score,
-        },
-    )
+async def test_opencode_app_bootstrap_route_proxies_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({
+                "applications": [
+                    {"app_id": "app-a", "mcp_url": "http://localhost:13100/mcp", "timeout_ms": 60000}
+                ]
+            }).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
+            "/api/v1/internal/workspaces/workspace-1/opencode-apps/start",
+            json={
+                "workspace_dir": "/tmp/workspace-1",
+                "holaboss_user_id": "user-1",
+                "resolved_applications": [
+                    {
+                        "app_id": "app-a",
+                        "mcp": {"transport": "http-sse", "port": 3099, "path": "/mcp"},
+                        "health_check": {"path": "/health", "timeout_s": 60, "interval_s": 5},
+                        "env_contract": ["HOLABOSS_USER_ID"],
+                        "start_command": "",
+                        "base_dir": "apps/app-a",
+                        "lifecycle": {"setup": "", "start": "npm run start", "stop": "npm run stop"},
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["applications"][0]["app_id"] == "app-a"
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/internal/workspaces/workspace-1/opencode-apps/start",
+        "params": None,
+        "json_body": {
+            "workspace_dir": "/tmp/workspace-1",
+            "holaboss_user_id": "user-1",
+            "resolved_applications": [
+                {
+                    "app_id": "app-a",
+                    "mcp": {"transport": "http-sse", "port": 3099, "path": "/mcp"},
+                    "health_check": {"path": "/health", "timeout_s": 60, "interval_s": 5},
+                    "env_contract": ["HOLABOSS_USER_ID"],
+                    "start_command": "",
+                    "base_dir": "apps/app-a",
+                    "lifecycle": {"setup": "", "start": "npm run start", "stop": "npm run stop"},
+                }
+            ],
+        },
+    }]
+
+
+@pytest.mark.asyncio
+async def test_memory_routes_proxy_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        if path.endswith("/search"):
+            payload = {"workspace_id": "workspace-1", "query": "durable preferences", "hits": []}
+        elif path.endswith("/get"):
+            payload = {"path": "workspace/workspace-1/preferences.md", "text": ""}
+        elif path.endswith("/upsert"):
+            payload = {"path": "workspace/workspace-1/preferences.md", "updated": True}
+        elif path.endswith("/status"):
+            payload = {"workspace_id": "workspace-1", "synced": True}
+        else:
+            payload = {"workspace_id": "workspace-1", "queued": True}
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        searched = await client.post(
             "/api/v1/memory/search",
             json={
                 "workspace_id": "workspace-1",
@@ -184,175 +257,131 @@ async def test_memory_search_endpoint_uses_shared_operations(monkeypatch: pytest
                 "min_score": 0.1,
             },
         )
-
-    assert response.status_code == 200
-    assert response.json()["workspace_id"] == "workspace-1"
-    assert response.json()["query"] == "durable preferences"
-
-
-@pytest.mark.asyncio
-async def test_memory_status_endpoint_returns_400_on_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _boom(*, workspace_id: str) -> dict[str, object]:
-        del workspace_id
-        raise ValueError("bad workspace")
-
-    monkeypatch.setattr("sandbox_agent_runtime.api.memory_status", _boom)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/api/v1/memory/status", json={"workspace_id": "workspace-1"})
-
-    assert response.status_code == 400
-    assert "bad workspace" in response.json()["detail"]
-
-
-@pytest.mark.asyncio
-async def test_memory_get_endpoint_returns_empty_text_when_file_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _missing(*, workspace_id: str, path: str, from_line: int | None, lines: int | None) -> dict[str, object]:
-        del workspace_id, path, from_line, lines
-        raise FileNotFoundError("workspace/workspace-1/preferences.md")
-
-    monkeypatch.setattr("sandbox_agent_runtime.api.memory_get", _missing)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post(
+        fetched = await client.post(
             "/api/v1/memory/get",
             json={"workspace_id": "workspace-1", "path": "workspace/workspace-1/preferences.md"},
         )
+        upserted = await client.post(
+            "/api/v1/memory/upsert",
+            json={
+                "workspace_id": "workspace-1",
+                "path": "workspace/workspace-1/preferences.md",
+                "content": "coffee",
+                "append": False,
+            },
+        )
+        status = await client.post("/api/v1/memory/status", json={"workspace_id": "workspace-1"})
+        synced = await client.post(
+            "/api/v1/memory/sync",
+            json={"workspace_id": "workspace-1", "reason": "manual", "force": True},
+        )
 
-    assert response.status_code == 200
-    assert response.json() == {"path": "workspace/workspace-1/preferences.md", "text": ""}
+    assert searched.status_code == 200
+    assert fetched.status_code == 200
+    assert upserted.status_code == 200
+    assert status.status_code == 200
+    assert synced.status_code == 200
+    assert captured == [
+        {
+            "method": "POST",
+            "path": "/api/v1/memory/search",
+            "params": None,
+            "json_body": {
+                "workspace_id": "workspace-1",
+                "query": "durable preferences",
+                "max_results": 5,
+                "min_score": 0.1,
+            },
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/memory/get",
+            "params": None,
+            "json_body": {
+                "workspace_id": "workspace-1",
+                "path": "workspace/workspace-1/preferences.md",
+                "from_line": None,
+                "lines": None,
+            },
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/memory/upsert",
+            "params": None,
+            "json_body": {
+                "workspace_id": "workspace-1",
+                "path": "workspace/workspace-1/preferences.md",
+                "content": "coffee",
+                "append": False,
+            },
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/memory/status",
+            "params": None,
+            "json_body": {"workspace_id": "workspace-1"},
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/memory/sync",
+            "params": None,
+            "json_body": {"workspace_id": "workspace-1", "reason": "manual", "force": True},
+        },
+    ]
 
 
 @pytest.mark.asyncio
-async def test_runtime_config_endpoints_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    sandbox_root = tmp_path / "sandbox-root"
-    config_path = sandbox_root / "state" / "runtime-config.json"
-    monkeypatch.setenv("HB_SANDBOX_ROOT", str(sandbox_root))
-    monkeypatch.setenv("HOLABOSS_RUNTIME_CONFIG_PATH", str(config_path))
-    monkeypatch.delenv("HOLABOSS_SANDBOX_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("HOLABOSS_USER_ID", raising=False)
-    monkeypatch.delenv("HOLABOSS_MODEL_PROXY_BASE_URL", raising=False)
-    monkeypatch.delenv("HOLABOSS_DEFAULT_MODEL", raising=False)
-    monkeypatch.setattr("sandbox_agent_runtime.api._ensure_selected_harness_ready", lambda: asyncio.sleep(0, "started"))
+async def test_runtime_config_and_status_routes_proxy_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        initial = await client.get("/api/v1/runtime/config")
-        assert initial.status_code == 200
-        assert initial.json()["auth_token_present"] is False
-        assert initial.json()["loaded_from_file"] is False
+    captured: list[dict[str, object]] = []
 
-        updated = await client.put(
-            "/api/v1/runtime/config",
-            json={
-                "auth_token": "token-1",
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        if path == "/api/v1/runtime/status":
+            payload = {
+                "harness": "opencode",
+                "config_loaded": True,
+                "config_path": "/tmp/runtime-config.json",
+                "opencode_config_present": True,
+                "harness_ready": True,
+                "harness_state": "ready",
+                "browser_available": False,
+                "browser_state": "unavailable",
+                "browser_url": None,
+            }
+        else:
+            payload = {
+                "config_path": "/tmp/runtime-config.json",
+                "loaded_from_file": True,
+                "auth_token_present": True,
                 "user_id": "user-1",
                 "sandbox_id": "sandbox-1",
-                "model_proxy_base_url": "http://54.214.105.154:3060/api/v1/model-proxy",
+                "model_proxy_base_url": "https://runtime.example/api/v1/model-proxy",
                 "default_model": "openai/gpt-5.1",
-            },
-        )
-        assert updated.status_code == 200
-        payload = updated.json()
-        assert payload["auth_token_present"] is True
-        assert payload["user_id"] == "user-1"
-        assert payload["sandbox_id"] == "sandbox-1"
-        assert payload["model_proxy_base_url"] == "http://54.214.105.154:3060/api/v1/model-proxy"
-        assert payload["default_model"] == "openai/gpt-5.1"
-        assert payload["runtime_mode"] == "oss"
-        assert payload["default_provider"] == "holaboss_model_proxy"
-        assert payload["holaboss_enabled"] is True
-        assert payload["desktop_browser_enabled"] is False
-        assert payload["desktop_browser_url"] is None
-        assert payload["config_path"] == str(config_path)
-        assert payload["loaded_from_file"] is True
-
-        current = await client.get("/api/v1/runtime/config")
-        assert current.status_code == 200
-        assert current.json()["auth_token_present"] is True
-        opencode_config = json.loads((sandbox_root / "workspace" / "opencode.json").read_text(encoding="utf-8"))
-        assert opencode_config["provider"]["openai"]["options"]["apiKey"] == "token-1"
-        assert opencode_config["provider"]["openai"]["options"]["headers"]["X-Holaboss-Sandbox-Id"] == "sandbox-1"
-
-
-@pytest.mark.asyncio
-async def test_runtime_config_endpoints_support_oss_direct_provider(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    sandbox_root = tmp_path / "sandbox-root"
-    config_path = sandbox_root / "state" / "runtime-config.json"
-    monkeypatch.setenv("HB_SANDBOX_ROOT", str(sandbox_root))
-    monkeypatch.setenv("HOLABOSS_RUNTIME_CONFIG_PATH", str(config_path))
-    monkeypatch.delenv("HOLABOSS_SANDBOX_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("HOLABOSS_USER_ID", raising=False)
-    monkeypatch.delenv("HOLABOSS_MODEL_PROXY_BASE_URL", raising=False)
-    monkeypatch.delenv("HOLABOSS_DEFAULT_MODEL", raising=False)
-    monkeypatch.setattr("sandbox_agent_runtime.api._ensure_selected_harness_ready", lambda: asyncio.sleep(0, "started"))
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        updated = await client.put(
-            "/api/v1/runtime/config",
-            json={
-                "sandbox_id": "sandbox-oss-1",
-                "default_model": "gpt-5.1",
                 "runtime_mode": "oss",
-                "default_provider": "openai",
-                "holaboss_enabled": False,
-            },
-        )
-        assert updated.status_code == 200
-        payload = updated.json()
-        assert payload["auth_token_present"] is False
-        assert payload["user_id"] is None
-        assert payload["sandbox_id"] == "sandbox-oss-1"
-        assert payload["model_proxy_base_url"] is None
-        assert payload["default_model"] == "gpt-5.1"
-        assert payload["runtime_mode"] == "oss"
-        assert payload["default_provider"] == "openai"
-        assert payload["holaboss_enabled"] is False
-        assert payload["desktop_browser_enabled"] is False
-        assert payload["desktop_browser_url"] is None
-        assert payload["config_path"] == str(config_path)
-        assert payload["loaded_from_file"] is True
+                "default_provider": "holaboss_model_proxy",
+                "holaboss_enabled": True,
+                "desktop_browser_enabled": False,
+                "desktop_browser_url": None,
+            }
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
 
-    assert not (sandbox_root / "workspace" / "opencode.json").exists()
-
-
-@pytest.mark.asyncio
-async def test_runtime_status_reports_pending_config_then_ready(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    sandbox_root = tmp_path / "sandbox-root"
-    config_path = sandbox_root / "state" / "runtime-config.json"
-    monkeypatch.setenv("HB_SANDBOX_ROOT", str(sandbox_root))
-    monkeypatch.setenv("HOLABOSS_RUNTIME_CONFIG_PATH", str(config_path))
-    monkeypatch.setenv("HOLABOSS_MODEL_PROXY_BASE_URL", "https://runtime.example/api/v1/model-proxy")
-
-    readiness = {"ready": False}
-
-    async def _fake_workspace_mcp_is_ready(*, url: str) -> bool:
-        assert url == "http://127.0.0.1:4096/mcp"
-        return readiness["ready"]
-
-    async def _fake_ensure_selected_harness_ready() -> str:
-        readiness["ready"] = True
-        return "started"
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._workspace_mcp_is_ready", _fake_workspace_mcp_is_ready)
-    monkeypatch.setattr("sandbox_agent_runtime.api._ensure_selected_harness_ready", _fake_ensure_selected_harness_ready)
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        pending = await client.get("/api/v1/runtime/status")
-        assert pending.status_code == 200
-        assert pending.json()["harness_state"] == "pending_config"
-        assert pending.json()["harness_ready"] is False
-        assert pending.json()["browser_state"] == "unavailable"
-        assert pending.json()["browser_available"] is False
-
+        config = await client.get("/api/v1/runtime/config")
+        status = await client.get("/api/v1/runtime/status")
         updated = await client.put(
             "/api/v1/runtime/config",
             json={
@@ -361,55 +390,43 @@ async def test_runtime_status_reports_pending_config_then_ready(
                 "sandbox_id": "sandbox-1",
                 "model_proxy_base_url": "https://runtime.example/api/v1/model-proxy",
                 "default_model": "openai/gpt-5.1",
-                "desktop_browser_enabled": True,
             },
         )
-        assert updated.status_code == 200
 
-        ready = await client.get("/api/v1/runtime/status")
-        assert ready.status_code == 200
-        assert ready.json()["config_loaded"] is True
-        assert ready.json()["opencode_config_present"] is True
-        assert ready.json()["harness_ready"] is True
-        assert ready.json()["harness_state"] == "ready"
-        assert ready.json()["browser_state"] == "enabled_unconfigured"
-        assert ready.json()["browser_available"] is False
-
-
-@pytest.mark.asyncio
-async def test_runtime_status_reports_available_desktop_browser_when_url_is_configured(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    sandbox_root = tmp_path / "sandbox-root"
-    config_path = sandbox_root / "state" / "runtime-config.json"
-    monkeypatch.setenv("HB_SANDBOX_ROOT", str(sandbox_root))
-    monkeypatch.setenv("HOLABOSS_RUNTIME_CONFIG_PATH", str(config_path))
-
-    async def _fake_workspace_mcp_is_ready(*, url: str) -> bool:
-        assert url == "http://127.0.0.1:4096/mcp"
-        return False
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._workspace_mcp_is_ready", _fake_workspace_mcp_is_ready)
-    monkeypatch.setattr("sandbox_agent_runtime.api._ensure_selected_harness_ready", lambda: asyncio.sleep(0, "started"))
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        updated = await client.put(
-            "/api/v1/runtime/config",
-            json={
-                "desktop_browser_enabled": True,
-                "desktop_browser_url": "http://127.0.0.1:8787/api/v1/browser",
+    assert config.status_code == 200
+    assert status.status_code == 200
+    assert updated.status_code == 200
+    assert captured == [
+        {
+            "method": "GET",
+            "path": "/api/v1/runtime/config",
+            "params": None,
+            "json_body": None,
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/runtime/status",
+            "params": None,
+            "json_body": None,
+        },
+        {
+            "method": "PUT",
+            "path": "/api/v1/runtime/config",
+            "params": None,
+            "json_body": {
+                "auth_token": "token-1",
+                "user_id": "user-1",
+                "sandbox_id": "sandbox-1",
+                "model_proxy_base_url": "https://runtime.example/api/v1/model-proxy",
+                "default_model": "openai/gpt-5.1",
+                "runtime_mode": None,
+                "default_provider": None,
+                "holaboss_enabled": None,
+                "desktop_browser_enabled": None,
+                "desktop_browser_url": None,
             },
-        )
-        assert updated.status_code == 200
-        assert updated.json()["desktop_browser_enabled"] is True
-        assert updated.json()["desktop_browser_url"] == "http://127.0.0.1:8787/api/v1/browser"
-
-        status = await client.get("/api/v1/runtime/status")
-        assert status.status_code == 200
-        assert status.json()["browser_available"] is True
-        assert status.json()["browser_state"] == "available"
-        assert status.json()["browser_url"] == "http://127.0.0.1:8787/api/v1/browser"
+        },
+    ]
 
 
 @pytest.fixture
@@ -438,13 +455,31 @@ def _write_workspace_apps(workspace_root: Path, workspace_id: str, app_ids: list
 
 
 @pytest.mark.asyncio
-async def test_list_app_ports_returns_deterministic_workspace_ports(
+async def test_app_ports_endpoint_proxies_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    runtime_db_env: Path,
 ) -> None:
-    workspace_root = tmp_path / "workspace-root"
-    _write_workspace_apps(workspace_root, "workspace-1", ["app-a", "app-b"])
-    monkeypatch.setattr(api_module, "WORKSPACE_ROOT", str(workspace_root))
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({
+                "app-a": {"http": 18080, "mcp": 13100},
+                "app-b": {"http": 18081, "mcp": 13101},
+            }).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -455,553 +490,370 @@ async def test_list_app_ports_returns_deterministic_workspace_ports(
         "app-a": {"http": 18080, "mcp": 13100},
         "app-b": {"http": 18081, "mcp": 13101},
     }
+    assert captured == [{
+        "method": "GET",
+        "path": "/api/v1/apps/ports",
+        "params": {"workspace_id": "workspace-1"},
+        "json_body": None,
+    }]
 
 
 @pytest.mark.asyncio
-async def test_start_app_endpoint_assigns_deterministic_ports_from_workspace_order(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    workspace_root = tmp_path / "workspace-root"
-    _write_workspace_apps(workspace_root, "workspace-1", ["app-a", "app-b"])
-    monkeypatch.setattr(api_module, "WORKSPACE_ROOT", str(workspace_root))
-    api_module._lifecycle_managers.clear()
-
-    async def _healthy(*args, **kwargs) -> bool:
-        del args, kwargs
-        return True
-
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.application_lifecycle.ApplicationLifecycleManager._is_app_healthy",
-        _healthy,
-    )
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/api/v1/apps/app-b/start", json={"workspace_id": "workspace-1"})
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["app_id"] == "app-b"
-    assert payload["ports"] == {"http": 18081, "mcp": 13101}
-    assert api_module._lifecycle_managers["workspace-1"]._port_allocations["app-b"] == (18081, 13101)
-
-
-@pytest.mark.asyncio
-async def test_queue_endpoint_persists_local_input_and_runtime_state(
+async def test_app_lifecycle_routes_proxy_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     runtime_db_env: Path,
 ) -> None:
     del runtime_db_env
 
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
+    captured: list[dict[str, object]] = []
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace 1",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        if path.endswith("/start"):
+            payload = {
+                "app_id": "app-b",
+                "status": "started",
+                "detail": "app started with lifecycle manager",
+                "ports": {"http": 18081, "mcp": 13101},
+            }
+        elif path.endswith("/stop"):
+            payload = {
+                "app_id": "app-b",
+                "status": "stopped",
+                "detail": "app stopped via lifecycle manager",
+                "ports": {},
+            }
+        else:
+            payload = {
+                "app_id": "app-b",
+                "status": "uninstalled",
+                "detail": "App stopped, files removed, workspace.yaml updated",
+                "ports": {},
+            }
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        started = await client.post("/api/v1/apps/app-b/start", json={"workspace_id": "workspace-1"})
+        stopped = await client.post("/api/v1/apps/app-b/stop", json={"workspace_id": "workspace-1"})
+        uninstalled = await client.request("DELETE", "/api/v1/apps/app-b", json={"workspace_id": "workspace-1"})
+
+    assert started.status_code == 200
+    assert stopped.status_code == 200
+    assert uninstalled.status_code == 200
+    assert captured == [
+        {
+            "method": "POST",
+            "path": "/api/v1/apps/app-b/start",
+            "params": None,
+            "json_body": {"workspace_id": "workspace-1", "env": {}},
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/apps/app-b/stop",
+            "params": None,
+            "json_body": {"workspace_id": "workspace-1"},
+        },
+        {
+            "method": "DELETE",
+            "path": "/api/v1/apps/app-b",
+            "params": None,
+            "json_body": {"workspace_id": "workspace-1"},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_shutdown_route_proxies_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({"stopped": ["app-a"], "failed": []}).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/lifecycle/shutdown")
+
+    assert response.status_code == 200
+    assert response.json() == {"stopped": ["app-a"], "failed": []}
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/lifecycle/shutdown",
+        "params": None,
+        "json_body": None,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_internal_opencode_app_start_route_proxies_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({"items": []}).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/internal/workspaces/workspace-1/opencode-apps/start",
+            json={
+                "workspace_dir": "/tmp/workspace-1",
+                "holaboss_user_id": "user-1",
+                "resolved_applications": [{"app_id": "app-a"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/internal/workspaces/workspace-1/opencode-apps/start",
+        "params": None,
+        "json_body": {
+            "workspace_dir": "/tmp/workspace-1",
+            "holaboss_user_id": "user-1",
+            "resolved_applications": [{"app_id": "app-a"}],
+        },
+    }]
+
+
+@pytest.mark.asyncio
+async def test_queue_endpoint_proxies_to_ts_api_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({"input_id": "input-1", "session_id": "session-main", "status": "QUEUED"}).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/api/v1/agent-sessions/queue",
             json={
-                "workspace_id": workspace.id,
+                "workspace_id": "workspace-1",
                 "text": "hello world",
             },
         )
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["session_id"] == "session-main"
-    assert payload["status"] == "QUEUED"
-
-    queued = get_input(payload["input_id"])
-    assert queued is not None
-    assert queued.payload["text"] == "hello world"
-    assert "holaboss_user_id" not in queued.payload
-    runtime_states = list_runtime_states(workspace.id)
-    assert runtime_states[0]["status"] == "QUEUED"
-    assert runtime_states[0]["current_input_id"] == payload["input_id"]
+    assert response.json()["input_id"] == "input-1"
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/agent-sessions/queue",
+        "params": None,
+        "json_body": {
+            "workspace_id": "workspace-1",
+            "text": "hello world",
+            "holaboss_user_id": None,
+            "image_urls": None,
+            "session_id": None,
+            "idempotency_key": None,
+            "priority": 0,
+            "model": None,
+        },
+    }]
 
 
 @pytest.mark.asyncio
-async def test_process_claimed_input_hydrates_runtime_exec_context_from_runtime_config(
+async def test_workspace_create_endpoint_proxies_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     runtime_db_env: Path,
 ) -> None:
     del runtime_db_env
-    workspace = create_workspace(
-        name="Workspace hydrate context",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-    queued = enqueue_input(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        payload={"text": "hello", "context": {}},
-    )
-    claimed = claim_inputs(limit=1, claimed_by="test-worker", lease_seconds=60)
-    assert claimed
-    record = claimed[0]
-    assert record.input_id == queued.input_id
 
-    captured_context: dict[str, object] = {}
+    captured: list[dict[str, object]] = []
 
-    async def _fake_execute_runner_request(request, on_event=None):
-        del on_event
-        captured_context.update(request.context)
-        return api_module._RunnerExecutionResult(
-            events=[],
-            skipped_lines=[],
-            stderr="",
-            return_code=0,
-            saw_terminal=True,
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({"workspace": {"id": "workspace-ts", "status": "active"}}).encode("utf-8"),
+            media_type="application/json",
         )
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._execute_runner_request", _fake_execute_runner_request)
-    monkeypatch.setattr(
-        "sandbox_agent_runtime.api.resolve_product_runtime_config",
-        lambda **kwargs: SimpleNamespace(auth_token="token-1", sandbox_id="sandbox-1"),  # noqa: S106
-    )
-
-    await api_module._process_claimed_input(record)
-
-    runtime_context = captured_context["_sandbox_runtime_exec_v1"]
-    assert isinstance(runtime_context, dict)
-    assert runtime_context["model_proxy_api_key"] == "token-1"
-    assert runtime_context["sandbox_id"] == "sandbox-1"
-    assert runtime_context["harness"] == "opencode"
-    assert runtime_context["harness_session_id"] == "session-main"
-
-
-@pytest.mark.asyncio
-async def test_local_outputs_folders_and_artifacts_round_trip(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace Outputs",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        folder_resp = await client.post(
-            "/api/v1/output-folders",
-            json={"workspace_id": workspace.id, "name": "Drafts"},
-        )
-        assert folder_resp.status_code == 200
-        folder = folder_resp.json()["folder"]
-
-        output_resp = await client.post(
-            "/api/v1/outputs",
-            json={
-                "workspace_id": workspace.id,
-                "output_type": "document",
-                "title": "Spec Draft",
-                "folder_id": folder["id"],
-                "session_id": "session-main",
-            },
-        )
-        assert output_resp.status_code == 200
-        output = output_resp.json()["output"]
-        assert output["folder_id"] == folder["id"]
-
-        artifact_resp = await client.post(
-            "/api/v1/agent-sessions/session-main/artifacts",
-            json={
-                "workspace_id": workspace.id,
-                "artifact_type": "document",
-                "external_id": "doc-1",
-                "title": "Generated Doc",
-                "platform": "notion",
-            },
-        )
-        assert artifact_resp.status_code == 200
-
-        outputs_resp = await client.get("/api/v1/outputs", params={"workspace_id": workspace.id})
-        counts_resp = await client.get("/api/v1/outputs/counts", params={"workspace_id": workspace.id})
-        artifacts_resp = await client.get(
-            "/api/v1/agent-sessions/session-main/artifacts",
-            params={"workspace_id": workspace.id},
-        )
-        with_artifacts_resp = await client.get(
-            f"/api/v1/agent-sessions/by-workspace/{workspace.id}/with-artifacts",
-        )
-
-    assert outputs_resp.status_code == 200
-    assert counts_resp.status_code == 200
-    assert artifacts_resp.status_code == 200
-    assert with_artifacts_resp.status_code == 200
-    assert len(outputs_resp.json()["items"]) == 2
-    assert counts_resp.json()["total"] == 2
-    assert artifacts_resp.json()["count"] == 1
-    assert with_artifacts_resp.json()["items"][0]["artifacts"][0]["external_id"] == "doc-1"
-
-
-@pytest.mark.asyncio
-async def test_local_cronjobs_round_trip(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    async def _fake_cron_scheduler_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    monkeypatch.setattr("sandbox_agent_runtime.api._cron_scheduler_loop", _fake_cron_scheduler_loop)
-    workspace = create_workspace(
-        name="Workspace Cronjobs",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        created = await client.post(
-            "/api/v1/cronjobs",
-            json={
-                "workspace_id": workspace.id,
-                "initiated_by": "workspace_agent",
-                "cron": "0 9 * * *",
-                "description": "Daily check",
-                "delivery": {"mode": "announce", "channel": "session_run", "to": None},
-            },
-        )
-        assert created.status_code == 200
-        job = created.json()
-
-        listed = await client.get("/api/v1/cronjobs", params={"workspace_id": workspace.id})
-        fetched = await client.get(f"/api/v1/cronjobs/{job['id']}")
-        updated = await client.patch(
-            f"/api/v1/cronjobs/{job['id']}",
-            json={"description": "Updated check"},
-        )
-        deleted = await client.delete(f"/api/v1/cronjobs/{job['id']}")
-
-    assert listed.status_code == 200
-    assert listed.json()["count"] == 1
-    assert fetched.status_code == 200
-    assert updated.status_code == 200
-    assert updated.json()["description"] == "Updated check"
-    assert deleted.status_code == 200
-    assert deleted.json()["success"] is True
-
-
-@pytest.mark.asyncio
-async def test_local_task_proposals_round_trip(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace Task Proposals",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        created = await client.post(
-            "/api/v1/task-proposals",
-            json={
-                "proposal_id": "proposal-1",
-                "workspace_id": workspace.id,
-                "task_name": "Follow up",
-                "task_prompt": "Write a follow-up message",
-                "task_generation_rationale": "User has not replied",
-                "source_event_ids": ["evt-1"],
-                "created_at": datetime.now(UTC).isoformat(),
-            },
-        )
-        assert created.status_code == 200
-
-        listed = await client.get("/api/v1/task-proposals", params={"workspace_id": workspace.id})
-        unreviewed = await client.get("/api/v1/task-proposals/unreviewed", params={"workspace_id": workspace.id})
-        fetched = await client.get("/api/v1/task-proposals/proposal-1")
-        updated = await client.patch("/api/v1/task-proposals/proposal-1", json={"state": "accepted"})
-
-    assert listed.status_code == 200
-    assert listed.json()["count"] == 1
-    assert unreviewed.status_code == 200
-    assert unreviewed.json()["count"] == 1
-    assert fetched.status_code == 200
-    assert fetched.json()["proposal"]["proposal_id"] == "proposal-1"
-    assert updated.status_code == 200
-    assert updated.json()["proposal"]["state"] == "accepted"
-
-
-@pytest.mark.asyncio
-async def test_local_workspace_crud_endpoints_round_trip(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        created = await client.post(
+        response = await client.post(
             "/api/v1/workspaces",
             json={
-                "name": "Workspace 1",
+                "name": "Workspace TS",
                 "harness": "opencode",
-                "status": "provisioning",
+                "status": "active",
                 "main_session_id": "session-main",
             },
         )
-        assert created.status_code == 200
-        workspace = created.json()["workspace"]
-
-        listed = await client.get("/api/v1/workspaces")
-        fetched = await client.get(f"/api/v1/workspaces/{workspace['id']}")
-        updated = await client.patch(
-            f"/api/v1/workspaces/{workspace['id']}",
-            json={"status": "active", "onboarding_status": "pending"},
-        )
-        deleted = await client.delete(f"/api/v1/workspaces/{workspace['id']}")
-
-    assert listed.status_code == 200
-    assert listed.json()["total"] == 1
-    assert fetched.status_code == 200
-    assert fetched.json()["workspace"]["id"] == workspace["id"]
-    assert updated.status_code == 200
-    assert updated.json()["workspace"]["status"] == "active"
-    assert updated.json()["workspace"]["onboarding_status"] == "pending"
-    assert deleted.status_code == 200
-    assert deleted.json()["workspace"]["status"] == "deleted"
-
-
-@pytest.mark.asyncio
-async def test_local_workspace_exec_endpoint_runs_in_workspace_dir(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-    tmp_path: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    monkeypatch.setattr("sandbox_agent_runtime.api.WORKSPACE_ROOT", str(tmp_path / "workspace"))
-    monkeypatch.setattr("sandbox_agent_runtime.runtime_local_state.WORKSPACE_ROOT", str(tmp_path / "workspace"))
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        created = await client.post(
-            "/api/v1/workspaces",
-            json={
-                "name": "Workspace Exec",
-                "harness": "opencode",
-                "status": "active",
-            },
-        )
-        workspace = created.json()["workspace"]
-        response = await client.post(
-            f"/api/v1/sandbox/users/test-user/workspaces/{workspace['id']}/exec",
-            json={"command": "pwd", "timeout_s": 30},
-        )
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["returncode"] == 0
-    assert payload["stderr"] == ""
-    assert payload["stdout"].strip() == str((tmp_path / "workspace") / workspace["id"])
+    assert response.json()["workspace"]["id"] == "workspace-ts"
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/workspaces",
+        "params": None,
+        "json_body": {
+            "workspace_id": None,
+            "name": "Workspace TS",
+            "harness": "opencode",
+            "status": "active",
+            "main_session_id": "session-main",
+            "error_message": None,
+            "onboarding_status": "not_required",
+            "onboarding_session_id": None,
+            "onboarding_completed_at": None,
+            "onboarding_completion_summary": None,
+            "onboarding_requested_at": None,
+            "onboarding_requested_by": None,
+        },
+    }]
 
 
 @pytest.mark.asyncio
-async def test_local_workspace_patch_ignores_null_for_non_nullable_fields(
+async def test_history_and_output_events_endpoints_proxy_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     runtime_db_env: Path,
 ) -> None:
     del runtime_db_env
 
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
+    captured: list[dict[str, object]] = []
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        payload = {"ok": True}
+        if path.endswith("/history"):
+            payload = {"source": "sandbox_local_storage", "messages": []}
+        if path.endswith("/outputs/events"):
+            payload = {"items": [], "count": 0, "last_event_id": 12}
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        created = await client.post(
-            "/api/v1/workspaces",
-            json={
-                "name": "Workspace 2",
-                "harness": "opencode",
-                "status": "active",
-                "onboarding_status": "pending",
-                "error_message": "old error",
-            },
-        )
-        workspace = created.json()["workspace"]
-
-        updated = await client.patch(
-            f"/api/v1/workspaces/{workspace['id']}",
-            json={"onboarding_status": None, "error_message": None},
-        )
-
-    assert updated.status_code == 200
-    assert updated.json()["workspace"]["onboarding_status"] == "pending"
-    assert updated.json()["workspace"]["error_message"] is None
-
-
-@pytest.mark.asyncio
-async def test_runtime_states_and_history_endpoints_read_local_sqlite(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace 1",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-    upsert_binding(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        harness="opencode",
-        harness_session_id="harness-1",
-    )
-    insert_session_message(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        role="user",
-        text="hello",
-        message_id="m-1",
-    )
-    insert_session_message(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        role="assistant",
-        text="hi",
-        message_id="m-2",
-    )
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        states = await client.get(f"/api/v1/agent-sessions/by-workspace/{workspace.id}/runtime-states")
         history = await client.get(
             "/api/v1/agent-sessions/session-main/history",
-            params={"workspace_id": workspace.id},
+            params={"workspace_id": "workspace-1", "limit": 50, "offset": 5},
+        )
+        events = await client.get(
+            "/api/v1/agent-sessions/session-main/outputs/events",
+            params={"input_id": "input-1", "include_history": "false"},
         )
 
-    assert states.status_code == 200
-    assert states.json()["items"] == []
     assert history.status_code == 200
-    history_payload = history.json()
-    assert history_payload["source"] == "sandbox_local_storage"
-    assert history_payload["harness"] == "opencode"
-    assert [item["role"] for item in history_payload["messages"]] == ["user", "assistant"]
-
-
-@pytest.mark.asyncio
-async def test_session_state_endpoint_reads_local_runtime_and_queue(
-    monkeypatch: pytest.MonkeyPatch,
-    runtime_db_env: Path,
-) -> None:
-    del runtime_db_env
-
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace 1",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        queued = await client.post(
-            "/api/v1/agent-sessions/queue",
-            json={
-                "workspace_id": workspace.id,
-                "text": "hello world",
-                "holaboss_user_id": "user-1",
+    assert history.json()["source"] == "sandbox_local_storage"
+    assert events.status_code == 200
+    assert events.json()["last_event_id"] == 12
+    assert captured == [
+        {
+            "method": "GET",
+            "path": "/api/v1/agent-sessions/session-main/history",
+            "params": {
+                "workspace_id": "workspace-1",
+                "limit": 50,
+                "offset": 5,
+                "include_raw": False,
             },
-        )
-        assert queued.status_code == 200
-        state = await client.get(
-            "/api/v1/agent-sessions/session-main/state",
-            params={"workspace_id": workspace.id},
-        )
-
-    assert state.status_code == 200
-    assert state.json()["effective_state"] == "QUEUED"
-    assert state.json()["runtime_status"] == "QUEUED"
+            "json_body": None,
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/agent-sessions/session-main/outputs/events",
+            "params": {
+                "input_id": "input-1",
+                "include_history": False,
+                "after_event_id": 0,
+            },
+            "json_body": None,
+        },
+    ]
 
 
 @pytest.mark.asyncio
-async def test_output_stream_endpoint_tails_local_events(
+async def test_output_stream_endpoint_proxies_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     runtime_db_env: Path,
 ) -> None:
     del runtime_db_env
 
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
+    captured: list[dict[str, object]] = []
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace 1",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-    append_output_event(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        input_id="input-1",
-        sequence=1,
-        event_type="run_started",
-        payload={"instruction_preview": "hello"},
-    )
-    append_output_event(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        input_id="input-1",
-        sequence=2,
-        event_type="run_completed",
-        payload={"status": "success"},
-    )
+    async def _fake_stream(path: str, *, params=None):
+        captured.append({"path": path, "params": params})
+
+        async def _iter():
+            yield b": connected\n\n"
+            yield b"event: run_completed\ndata: {\"ok\":true}\n\n"
+
+        return StreamingResponse(_iter(), media_type="text/event-stream")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_stream", _fake_stream)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with (
@@ -1009,107 +861,547 @@ async def test_output_stream_endpoint_tails_local_events(
         client.stream(
             "GET",
             "/api/v1/agent-sessions/session-main/outputs/stream",
-            params={"input_id": "input-1"},
+            params={"input_id": "input-1", "include_history": "false"},
         ) as response,
     ):
         assert response.status_code == 200
-        body = await response.aread()
-        text = body.decode("utf-8", errors="replace")
+        text = (await response.aread()).decode("utf-8", errors="replace")
 
-    assert "event: run_started" in text
     assert "event: run_completed" in text
+    assert captured == [{
+        "path": "/api/v1/agent-sessions/session-main/outputs/stream",
+        "params": {
+            "input_id": "input-1",
+            "include_history": False,
+            "stop_on_terminal": True,
+        },
+    }]
 
 
 @pytest.mark.asyncio
-async def test_output_events_endpoint_returns_incremental_local_events(
+async def test_workspace_export_endpoint_proxies_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     runtime_db_env: Path,
 ) -> None:
     del runtime_db_env
 
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
+    captured: list[dict[str, object]] = []
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace 1",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-    append_output_event(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        input_id="input-1",
-        sequence=1,
-        event_type="run_started",
-        payload={"instruction_preview": "hello"},
-    )
-    append_output_event(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        input_id="input-1",
-        sequence=2,
-        event_type="output_delta",
-        payload={"delta": "hi"},
-    )
+    async def _fake_stream(path: str, *, params=None):
+        captured.append({"path": path, "params": params})
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(
-            "/api/v1/agent-sessions/session-main/outputs/events",
-            params={"input_id": "input-1", "after_event_id": 1},
+        async def _iter():
+            yield b"fake tarball"
+
+        return StreamingResponse(
+            _iter(),
+            media_type="application/gzip",
+            headers={"Content-Disposition": "attachment; filename=workspace-1.tar.gz"},
         )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["count"] == 1
-    assert payload["items"][0]["event_type"] == "output_delta"
-    assert payload["last_event_id"] == payload["items"][0]["id"]
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_stream", _fake_stream)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        client.stream("GET", "/api/v1/workspaces/workspace-1/export") as response,
+    ):
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/gzip")
+        body = await response.aread()
+
+    assert body == b"fake tarball"
+    assert captured == [{
+        "path": "/api/v1/workspaces/workspace-1/export",
+        "params": None,
+    }]
 
 
 @pytest.mark.asyncio
-async def test_output_events_endpoint_include_history_false_starts_at_tail(
+async def test_state_and_artifact_endpoints_proxy_to_ts_api_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
     runtime_db_env: Path,
 ) -> None:
     del runtime_db_env
 
-    async def _fake_worker_loop() -> None:
-        await asyncio.sleep(0)
+    captured: list[dict[str, object]] = []
 
-    monkeypatch.setattr("sandbox_agent_runtime.api._local_worker_loop", _fake_worker_loop)
-    workspace = create_workspace(
-        name="Workspace 1",
-        harness="opencode",
-        status="active",
-        main_session_id="session-main",
-    )
-    append_output_event(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        input_id="input-1",
-        sequence=1,
-        event_type="run_started",
-        payload={"instruction_preview": "hello"},
-    )
-    append_output_event(
-        workspace_id=workspace.id,
-        session_id="session-main",
-        input_id="input-1",
-        sequence=2,
-        event_type="run_completed",
-        payload={"status": "success"},
-    )
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        payload = {"ok": True}
+        if path.endswith("/state"):
+            payload = {"effective_state": "QUEUED", "runtime_status": "QUEUED", "current_input_id": None, "heartbeat_at": None, "lease_until": None}
+        if path.endswith("/artifacts") and method == "POST":
+            payload = {"artifact": {"id": "artifact-1"}}
+        if path.endswith("/artifacts") and method == "GET":
+            payload = {"items": [], "count": 0}
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get(
-            "/api/v1/agent-sessions/session-main/outputs/events",
-            params={"input_id": "input-1", "include_history": "false"},
+        state = await client.get(
+            "/api/v1/agent-sessions/session-main/state",
+            params={"workspace_id": "workspace-1"},
+        )
+        created_artifact = await client.post(
+            "/api/v1/agent-sessions/session-main/artifacts",
+            json={
+                "workspace_id": "workspace-1",
+                "artifact_type": "document",
+                "external_id": "doc-1",
+            },
+        )
+        listed_artifacts = await client.get(
+            "/api/v1/agent-sessions/session-main/artifacts",
+            params={"workspace_id": "workspace-1"},
+        )
+
+    assert state.status_code == 200
+    assert state.json()["effective_state"] == "QUEUED"
+    assert created_artifact.status_code == 200
+    assert created_artifact.json()["artifact"]["id"] == "artifact-1"
+    assert listed_artifacts.status_code == 200
+    assert listed_artifacts.json()["count"] == 0
+    assert captured == [
+        {
+            "method": "GET",
+            "path": "/api/v1/agent-sessions/session-main/state",
+            "params": {"workspace_id": "workspace-1", "profile_id": None},
+            "json_body": None,
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/agent-sessions/session-main/artifacts",
+            "params": None,
+            "json_body": {
+                "workspace_id": "workspace-1",
+                "artifact_type": "document",
+                "external_id": "doc-1",
+                "platform": None,
+                "title": None,
+                "metadata": {},
+            },
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/agent-sessions/session-main/artifacts",
+            "params": {"workspace_id": "workspace-1", "profile_id": None},
+            "json_body": None,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_outputs_cronjobs_and_task_proposals_proxy_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        payload = {"ok": True}
+        if path == "/api/v1/output-folders":
+            payload = {"folder": {"id": "folder-1"}}
+        elif path == "/api/v1/outputs":
+            payload = {"items": [], "count": 0} if method == "GET" else {"output": {"id": "output-1"}}
+        elif path == "/api/v1/cronjobs":
+            payload = {"jobs": [], "count": 0} if method == "GET" else {"id": "job-1"}
+        elif path == "/api/v1/task-proposals":
+            payload = {"proposals": [], "count": 0} if method == "GET" else {"proposal": {"proposal_id": "proposal-1"}}
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        folder = await client.post("/api/v1/output-folders", json={"workspace_id": "workspace-1", "name": "Drafts"})
+        output = await client.post(
+            "/api/v1/outputs",
+            json={"workspace_id": "workspace-1", "output_type": "document", "title": "Spec"},
+        )
+        outputs = await client.get("/api/v1/outputs", params={"workspace_id": "workspace-1"})
+        cronjobs = await client.get("/api/v1/cronjobs", params={"workspace_id": "workspace-1"})
+        proposal = await client.post(
+            "/api/v1/task-proposals",
+            json={
+                "proposal_id": "proposal-1",
+                "workspace_id": "workspace-1",
+                "task_name": "Follow up",
+                "task_prompt": "Write a follow-up message",
+                "task_generation_rationale": "User has not replied",
+                "source_event_ids": ["evt-1"],
+                "created_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    assert folder.status_code == 200
+    assert folder.json()["folder"]["id"] == "folder-1"
+    assert output.status_code == 200
+    assert output.json()["output"]["id"] == "output-1"
+    assert outputs.status_code == 200
+    assert cronjobs.status_code == 200
+    assert proposal.status_code == 200
+    assert proposal.json()["proposal"]["proposal_id"] == "proposal-1"
+
+
+@pytest.mark.asyncio
+async def test_workspace_exec_endpoint_proxies_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({"stdout": "/tmp/workspace\n", "stderr": "", "returncode": 0}).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/sandbox/users/test-user/workspaces/workspace-1/exec",
+            json={"command": "pwd", "timeout_s": 30},
         )
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["count"] == 0
-    assert payload["last_event_id"] >= 2
+    assert response.json()["returncode"] == 0
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/sandbox/users/test-user/workspaces/workspace-1/exec",
+        "params": None,
+        "json_body": {"command": "pwd", "timeout_s": 30},
+    }]
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_routes_proxy_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        if method == "GET":
+            payload = {"path": "docs/readme.md", "content": "hello", "encoding": "utf-8"}
+        elif method == "PUT":
+            payload = {"path": "docs/readme.md", "status": "written"}
+        else:
+            payload = {"status": "applied", "files_written": 1}
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        applied = await client.post(
+            "/api/v1/workspaces/workspace-1/apply-template",
+            json={"files": [{"path": "docs/readme.md", "content_base64": "aGVsbG8="}], "replace_existing": False},
+        )
+        read = await client.get("/api/v1/workspaces/workspace-1/files/docs/readme.md")
+        written = await client.put(
+            "/api/v1/workspaces/workspace-1/files/docs/readme.md",
+            json={"content_base64": "aGVsbG8=", "executable": False},
+        )
+        snapshot = await client.get("/api/v1/workspaces/workspace-1/snapshot")
+
+    assert applied.status_code == 200
+    assert read.status_code == 200
+    assert written.status_code == 200
+    assert snapshot.status_code == 200
+    assert captured == [
+        {
+            "method": "POST",
+            "path": "/api/v1/workspaces/workspace-1/apply-template",
+            "params": None,
+            "json_body": {
+                "files": [{"path": "docs/readme.md", "content_base64": "aGVsbG8="}],
+                "replace_existing": False,
+            },
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/workspaces/workspace-1/files/docs/readme.md",
+            "params": None,
+            "json_body": None,
+        },
+        {
+            "method": "PUT",
+            "path": "/api/v1/workspaces/workspace-1/files/docs/readme.md",
+            "params": None,
+            "json_body": {"content_base64": "aGVsbG8=", "executable": False},
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/workspaces/workspace-1/snapshot",
+            "params": None,
+            "json_body": None,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_app_install_and_status_routes_proxy_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        payload = {"ok": True}
+        if path == "/api/v1/apps":
+            payload = {"apps": [], "count": 0}
+        elif path.endswith("/build-status"):
+            payload = {"status": "unknown"}
+        elif path.endswith("/setup"):
+            payload = {"app_id": "demo-app", "status": "setup_started", "detail": "Running: npm install", "ports": {}}
+        elif path == "/api/v1/apps/install":
+            payload = {"app_id": "demo-app", "status": "installed", "detail": "Files written, no setup command defined"}
+        return Response(content=json.dumps(payload).encode("utf-8"), media_type="application/json")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        installed = await client.post(
+            "/api/v1/apps/install",
+            json={
+                "app_id": "demo-app",
+                "workspace_id": "workspace-1",
+                "files": [{"path": "app.runtime.yaml", "content_base64": "ZGVtbw=="}],
+            },
+        )
+        listed = await client.get("/api/v1/apps", params={"workspace_id": "workspace-1"})
+        build_status = await client.get("/api/v1/apps/demo-app/build-status", params={"workspace_id": "workspace-1"})
+        setup = await client.post(
+            "/api/v1/apps/demo-app/setup",
+            json={"workspace_id": "workspace-1"},
+        )
+
+    assert installed.status_code == 200
+    assert listed.status_code == 200
+    assert build_status.status_code == 200
+    assert setup.status_code == 200
+    assert captured == [
+        {
+            "method": "POST",
+            "path": "/api/v1/apps/install",
+            "params": None,
+            "json_body": {
+                "app_id": "demo-app",
+                "workspace_id": "workspace-1",
+                "files": [{"path": "app.runtime.yaml", "content_base64": "ZGVtbw=="}],
+            },
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/apps",
+            "params": {"workspace_id": "workspace-1"},
+            "json_body": None,
+        },
+        {
+            "method": "GET",
+            "path": "/api/v1/apps/demo-app/build-status",
+            "params": {"workspace_id": "workspace-1"},
+            "json_body": None,
+        },
+        {
+            "method": "POST",
+            "path": "/api/v1/apps/demo-app/setup",
+            "params": None,
+            "json_body": {"workspace_id": "workspace-1"},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queue_endpoint_proxies_to_ts_api_when_enabled_and_does_not_wake_python_worker_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_proxy(method: str, path: str, *, params=None, json_body=None):
+        captured.append({
+            "method": method,
+            "path": path,
+            "params": params,
+            "json_body": json_body,
+        })
+        return Response(
+            content=json.dumps({"input_id": "input-1", "session_id": "session-main", "status": "QUEUED"}).encode("utf-8"),
+            media_type="application/json",
+        )
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_json", _fake_proxy)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/agent-sessions/queue",
+            json={"workspace_id": "workspace-1", "text": "hello world"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["input_id"] == "input-1"
+    assert captured == [{
+        "method": "POST",
+        "path": "/api/v1/agent-sessions/queue",
+        "params": None,
+        "json_body": {
+            "workspace_id": "workspace-1",
+            "text": "hello world",
+            "holaboss_user_id": None,
+            "image_urls": None,
+            "session_id": None,
+            "idempotency_key": None,
+            "priority": 0,
+            "model": None,
+        },
+    }]
+
+
+@pytest.mark.asyncio
+async def test_unreviewed_task_proposal_stream_proxies_to_ts_api_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_db_env: Path,
+) -> None:
+    del runtime_db_env
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_stream(path: str, *, params=None):
+        captured.append({"path": path, "params": params})
+
+        async def _iter():
+            yield b": connected\n\n"
+            yield b"event: insert\ndata: {\"proposal_id\":\"proposal-1\"}\n\n"
+
+        return StreamingResponse(_iter(), media_type="text/event-stream")
+
+    monkeypatch.setattr(api_module._ts_api_proxy, "proxy_ts_api_stream", _fake_stream)
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+
+    transport = ASGITransport(app=app)
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as client,
+        client.stream(
+            "GET",
+            "/api/v1/task-proposals/unreviewed/stream",
+            params={"workspace_id": "workspace-1"},
+        ) as response,
+    ):
+        assert response.status_code == 200
+        text = (await response.aread()).decode("utf-8", errors="replace")
+
+    assert "event: insert" in text
+    assert captured == [{
+        "path": "/api/v1/task-proposals/unreviewed/stream",
+        "params": {"workspace_id": "workspace-1"},
+    }]
+
+
+@pytest.mark.asyncio
+async def test_managed_ts_api_server_starts_on_demand(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry_path = tmp_path / "index.mjs"
+    entry_path.write_text("console.log('stub')\n", encoding="utf-8")
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = 0
+
+    spawned: list[dict[str, object]] = []
+    fake_process = _FakeProcess()
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        return fake_process
+
+    async def _fake_healthz_ok() -> bool:
+        return True
+
+    monkeypatch.setenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", "1")
+    monkeypatch.setenv("HOLABOSS_RUNTIME_TS_API_PORT", "3061")
+    monkeypatch.delenv("HOLABOSS_RUNTIME_TS_API_URL", raising=False)
+    monkeypatch.setattr(api_module._ts_api_proxy, "ts_api_server_entry_path", lambda: entry_path)
+    monkeypatch.setattr(api_module._ts_api_proxy, "ts_api_healthz_ok", _fake_healthz_ok)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(api_module.app.state, "ts_api_server_state", None, raising=False)
+
+    await api_module._ts_api_proxy.ensure_managed_ts_api_server_ready()
+
+    assert len(spawned) == 1
+    assert spawned[0]["args"][:2] == ("node", str(entry_path))
+    assert spawned[0]["kwargs"]["env"]["SANDBOX_RUNTIME_API_PORT"] == "3061"
+    assert api_module.app.state.ts_api_server_state.process is fake_process
+
+    await api_module._ts_api_proxy.shutdown_managed_ts_api_server()
+
+
+def test_ts_api_server_enabled_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HOLABOSS_RUNTIME_USE_TS_API_SERVER", raising=False)
+
+    assert api_module._ts_api_proxy.ts_api_server_enabled() is True
