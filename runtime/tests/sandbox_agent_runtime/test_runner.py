@@ -2415,6 +2415,42 @@ def test_map_opencode_event_supports_message_part_delta_dict_properties_aliases(
     ]
 
 
+def test_map_opencode_event_prefers_part_text_snapshot_over_packed_raw_delta() -> None:
+    raw_event = SimpleNamespace(
+        type="message.part.delta",
+        properties=SimpleNamespace(
+            session_id="opencode-session-1",
+            delta="Imheretowrite",
+            part=SimpleNamespace(
+                type="text",
+                id="text-part-1",
+                text="I'm here to write",
+            ),
+        ),
+    )
+
+    events = _map_opencode_event(
+        raw_event=raw_event,
+        target_session_id="opencode-session-1",
+        text_snapshots={},
+        tool_snapshots={},
+    )
+
+    assert events == [
+        (
+            "output_delta",
+            {
+                "delta": "I'm here to write",
+                "event": "message.part.delta",
+                "source": "opencode",
+                "part_id": "text-part-1",
+                "part_type": "text",
+                "delta_kind": "output",
+            },
+        )
+    ]
+
+
 def test_map_opencode_event_maps_session_status_idle_to_run_completed() -> None:
     raw_event = SimpleNamespace(
         type="session.status",
