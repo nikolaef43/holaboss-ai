@@ -56,6 +56,7 @@ from sandbox_agent_runtime.ts_bridge import (
     command_error_detail,
     encode_json_base64,
     run_async_command_capture,
+    runtime_root_dir,
     ts_exec_command_from_json,
     validate_json_output,
 )
@@ -307,7 +308,7 @@ async def _emit_event_with_push(*, event: RunnerOutputEvent, push_client: _PushE
 
 
 def _runtime_root_dir() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return runtime_root_dir(__file__)
 
 
 def _ts_harness_host_entry_path() -> Path:
