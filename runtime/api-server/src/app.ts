@@ -54,6 +54,11 @@ import {
   type RuntimeConfigServiceLike
 } from "./runtime-config.js";
 import {
+  DesktopBrowserToolService,
+  DesktopBrowserToolServiceError,
+  type DesktopBrowserToolServiceLike
+} from "./desktop-browser-tools.js";
+import {
   appendWorkspaceApplication,
   listWorkspaceComposeShutdownTargets,
   listWorkspaceApplicationPorts,
@@ -70,7 +75,7 @@ import {
   RunnerExecutorError,
   type RunnerExecutorLike,
 } from "./runner-worker.js";
-import { startOpencodeApplications } from "./opencode-bootstrap-shared.js";
+import { startResolvedApplications } from "./resolved-app-bootstrap.js";
 import { buildAppSetupEnv } from "./app-setup-env.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 50;
@@ -87,6 +92,7 @@ export interface BuildRuntimeApiServerOptions {
   appLifecycleExecutor?: AppLifecycleExecutorLike;
   memoryService?: MemoryServiceLike;
   runtimeConfigService?: RuntimeConfigServiceLike;
+  browserToolService?: DesktopBrowserToolServiceLike;
   runnerExecutor?: RunnerExecutorLike;
 }
 
@@ -950,6 +956,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   const appLifecycleExecutor = options.appLifecycleExecutor ?? new RuntimeAppLifecycleExecutor();
   const memoryService = options.memoryService ?? new FilesystemMemoryService({ workspaceRoot: store.workspaceRoot });
   const runtimeConfigService = options.runtimeConfigService ?? new FileRuntimeConfigService();
+  const browserToolService = options.browserToolService ?? new DesktopBrowserToolService();
   const runnerExecutor = options.runnerExecutor ?? new NativeRunnerExecutor();
   const queueWorker = resolveQueueWorker(options, app, store);
   const cronWorker = resolveCronWorker(options, app, store, queueWorker);
@@ -1019,6 +1026,33 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
   });
 
+  app.get("/api/v1/capabilities/browser", async (request, reply) => {
+    void request;
+    try {
+      return await browserToolService.getStatus();
+    } catch (error) {
+      if (error instanceof DesktopBrowserToolServiceError) {
+        return sendError(reply, error.statusCode, error.message);
+      }
+      return sendError(reply, 500, error instanceof Error ? error.message : "browser capability status failed");
+    }
+  });
+
+  app.post("/api/v1/capabilities/browser/tools/:toolId", async (request, reply) => {
+    if (!isRecord(request.body)) {
+      return sendError(reply, 400, "request body must be an object");
+    }
+    const params = request.params as { toolId: string };
+    try {
+      return await browserToolService.execute(requiredString(params.toolId, "toolId"), request.body);
+    } catch (error) {
+      if (error instanceof DesktopBrowserToolServiceError) {
+        return sendError(reply, error.statusCode, error.message);
+      }
+      return sendError(reply, 500, error instanceof Error ? error.message : "browser tool execution failed");
+    }
+  });
+
   app.post("/api/v1/lifecycle/shutdown", async (request, reply) => {
     void request;
     try {
@@ -1040,7 +1074,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
     const params = request.params as { workspaceId: string };
     try {
-      return await startOpencodeApplications({
+      return await startResolvedApplications({
         store,
         appLifecycleExecutor,
         workspaceId: requiredString(params.workspaceId, "workspaceId"),

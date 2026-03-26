@@ -127,6 +127,57 @@ test("healthz returns ok", async () => {
   store.close();
 });
 
+test("browser capability routes proxy to the browser tool service", async () => {
+  const root = makeTempDir("hb-runtime-api-browser-capability-");
+  const store = new RuntimeStateStore({
+    dbPath: path.join(root, "runtime.db"),
+    workspaceRoot: path.join(root, "workspace")
+  });
+  const browserToolService = {
+    async getStatus() {
+      return {
+        available: true,
+        tools: [{ id: "browser_get_state" }]
+      };
+    },
+    async execute(toolId: string, args: Record<string, unknown>) {
+      return {
+        tool_id: toolId,
+        args
+      };
+    }
+  };
+  const app = buildTestRuntimeApiServer({ store, browserToolService });
+
+  const statusResponse = await app.inject({
+    method: "GET",
+    url: "/api/v1/capabilities/browser"
+  });
+  assert.equal(statusResponse.statusCode, 200);
+  assert.deepEqual(statusResponse.json(), {
+    available: true,
+    tools: [{ id: "browser_get_state" }]
+  });
+
+  const executeResponse = await app.inject({
+    method: "POST",
+    url: "/api/v1/capabilities/browser/tools/browser_click",
+    payload: {
+      index: 3
+    }
+  });
+  assert.equal(executeResponse.statusCode, 200);
+  assert.deepEqual(executeResponse.json(), {
+    tool_id: "browser_click",
+    args: {
+      index: 3
+    }
+  });
+
+  await app.close();
+  store.close();
+});
+
 test("buildAppSetupEnv uses an app-local npm cache", () => {
   const appDir = makeTempDir("hb-app-env-");
   const env = buildAppSetupEnv(appDir, { PATH: process.env.PATH });
@@ -168,6 +219,7 @@ test("runtime config routes delegate to the runtime config executor", async () =
         harness: "opencode",
         config_loaded: true,
         config_path: "/tmp/runtime-config.json",
+        backend_config_present: true,
         opencode_config_present: true,
         harness_ready: true,
         harness_state: "ready",
