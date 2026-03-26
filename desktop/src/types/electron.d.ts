@@ -529,7 +529,10 @@ declare global {
       onStateChange: (listener: (status: RuntimeStatusPayload) => void) => () => void;
     };
     ui: {
+      getTheme: () => Promise<string>;
+      toggleWindowSize: () => Promise<void>;
       setTheme: (theme: string) => Promise<void>;
+      onThemeChange: (listener: (theme: string) => void) => () => void;
     };
     appUpdate: {
       getStatus: () => Promise<AppUpdateStatusPayload>;
