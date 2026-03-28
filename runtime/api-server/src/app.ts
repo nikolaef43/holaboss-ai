@@ -119,6 +119,32 @@ function resolveCronWorker(
   return new RuntimeCronWorker({ store, logger: app.log, queueWorker });
 }
 
+function resolveBridgeWorker(
+  options: BuildRuntimeApiServerOptions,
+  app: FastifyInstance,
+  store: RuntimeStateStore,
+  memoryService: MemoryServiceLike
+): BridgeWorkerLike | null {
+  if (options.bridgeWorker !== undefined) {
+    return options.bridgeWorker;
+  }
+  if (!tsBridgeWorkerEnabled()) {
+    return null;
+  }
+  try {
+    return new RuntimeRemoteBridgeWorker({ logger: app.log, store, memoryService });
+  } catch (error) {
+    app.log.warn(
+      {
+        event: "runtime.proactive_bridge.disabled",
+        reason: error instanceof Error ? error.message : String(error)
+      },
+      "Remote proactive bridge disabled during startup"
+    );
+    return null;
+  }
+}
+
 type StringMap = Record<string, unknown>;
 
 interface SessionInputAttachmentPayload {
@@ -218,6 +244,14 @@ function optionalStringList(value: unknown): string[] {
     return [];
   }
   return value.filter((item): item is string => typeof item === "string");
+}
+
+function headerString(headers: Record<string, unknown>, key: string): string {
+  const raw = headers[key];
+  if (Array.isArray(raw)) {
+    return typeof raw[0] === "string" ? raw[0].trim() : "";
+  }
+  return typeof raw === "string" ? raw.trim() : "";
 }
 
 function parseSessionInputAttachment(value: unknown): SessionInputAttachmentPayload | null {
@@ -1025,12 +1059,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   const runnerExecutor = options.runnerExecutor ?? new NativeRunnerExecutor();
   const queueWorker = resolveQueueWorker(options, app, store);
   const cronWorker = resolveCronWorker(options, app, store, queueWorker);
-  const bridgeWorker =
-    options.bridgeWorker === undefined
-      ? tsBridgeWorkerEnabled()
-        ? new RuntimeRemoteBridgeWorker({ logger: app.log, store, memoryService })
-        : null
-      : options.bridgeWorker;
+  const bridgeWorker = resolveBridgeWorker(options, app, store, memoryService);
 
   app.addHook("onClose", async () => {
     await bridgeWorker?.close();
@@ -1092,9 +1121,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
   });
 
   app.get("/api/v1/capabilities/browser", async (request, reply) => {
-    void request;
+    const workspaceId = headerString(request.headers as Record<string, unknown>, "x-holaboss-workspace-id");
     try {
-      return await browserToolService.getStatus();
+      return await browserToolService.getStatus({ workspaceId });
     } catch (error) {
       if (error instanceof DesktopBrowserToolServiceError) {
         return sendError(reply, error.statusCode, error.message);
@@ -1108,8 +1137,9 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       return sendError(reply, 400, "request body must be an object");
     }
     const params = request.params as { toolId: string };
+    const workspaceId = headerString(request.headers as Record<string, unknown>, "x-holaboss-workspace-id");
     try {
-      return await browserToolService.execute(requiredString(params.toolId, "toolId"), request.body);
+      return await browserToolService.execute(requiredString(params.toolId, "toolId"), request.body, { workspaceId });
     } catch (error) {
       if (error instanceof DesktopBrowserToolServiceError) {
         return sendError(reply, error.statusCode, error.message);

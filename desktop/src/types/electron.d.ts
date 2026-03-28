@@ -164,6 +164,7 @@ declare global {
   }
 
   interface WorkbenchOpenBrowserPayload {
+    workspaceId?: string | null;
     url?: string | null;
   }
 
@@ -401,6 +402,23 @@ declare global {
     raw: unknown | null;
   }
 
+  interface SessionOutputEventPayload {
+    id: number;
+    workspace_id: string;
+    session_id: string;
+    input_id: string;
+    sequence: number;
+    event_type: string;
+    payload: Record<string, unknown>;
+    created_at: string;
+  }
+
+  interface SessionOutputEventListResponsePayload {
+    items: SessionOutputEventPayload[];
+    count: number;
+    last_event_id: number;
+  }
+
   interface EnqueueSessionInputResponsePayload {
     input_id: string;
     session_id: string;
@@ -464,6 +482,26 @@ declare global {
     items: WorkspaceOutputRecordPayload[];
   }
 
+  interface WorkspaceSkillRecordPayload {
+    skill_id: string;
+    source_dir: string;
+    skill_file_path: string;
+    title: string;
+    summary: string;
+    enabled: boolean;
+    modified_at: string;
+  }
+
+  interface WorkspaceSkillListResponsePayload {
+    workspace_id: string;
+    workspace_root: string;
+    skills_path: string;
+    configured_path: string;
+    enabled_skill_ids: string[];
+    missing_enabled_skill_ids: string[];
+    skills: WorkspaceSkillRecordPayload[];
+  }
+
   interface AuthUserPayload {
     id: string;
     email?: string | null;
@@ -486,7 +524,9 @@ declare global {
 
   interface HolabossCreateWorkspacePayload {
     holaboss_user_id: string;
+    harness?: string | null;
     name: string;
+    template_mode?: "template" | "empty" | null;
     template_root_path?: string | null;
     template_name?: string | null;
     template_ref?: string | null;
@@ -594,8 +634,10 @@ declare global {
       startInstalledApp: (workspaceId: string, appId: string) => Promise<WorkspaceAppLifecycleActionPayload>;
       stopInstalledApp: (workspaceId: string, appId: string) => Promise<WorkspaceAppLifecycleActionPayload>;
       listOutputs: (workspaceId: string) => Promise<WorkspaceOutputListResponsePayload>;
+      listSkills: (workspaceId: string) => Promise<WorkspaceSkillListResponsePayload>;
       getWorkspaceRoot: (workspaceId: string) => Promise<string>;
       createWorkspace: (payload: HolabossCreateWorkspacePayload) => Promise<WorkspaceResponsePayload>;
+      deleteWorkspace: (workspaceId: string) => Promise<WorkspaceResponsePayload>;
       listCronjobs: (workspaceId: string, enabledOnly?: boolean) => Promise<CronjobListResponsePayload>;
       createCronjob: (payload: CronjobCreatePayload) => Promise<CronjobRecordPayload>;
       updateCronjob: (jobId: string, payload: CronjobUpdatePayload) => Promise<CronjobRecordPayload>;
@@ -607,6 +649,7 @@ declare global {
       ) => Promise<DemoTaskProposalEnqueueResponsePayload>;
       listRuntimeStates: (workspaceId: string) => Promise<SessionRuntimeStateListResponsePayload>;
       getSessionHistory: (payload: { sessionId: string; workspaceId: string }) => Promise<SessionHistoryResponsePayload>;
+      getSessionOutputEvents: (payload: { sessionId: string }) => Promise<SessionOutputEventListResponsePayload>;
       stageSessionAttachments: (payload: StageSessionAttachmentsPayload) => Promise<StageSessionAttachmentsResponsePayload>;
       stageSessionAttachmentPaths: (
         payload: StageSessionAttachmentPathsPayload
@@ -632,6 +675,7 @@ declare global {
       onError: (callback: (context: AuthErrorPayload) => unknown) => () => void;
     };
     browser: {
+      setActiveWorkspace: (workspaceId?: string | null) => Promise<BrowserTabListPayload>;
       getState: () => Promise<BrowserTabListPayload>;
       setBounds: (bounds: BrowserBoundsPayload) => Promise<BrowserTabListPayload>;
       navigate: (targetUrl: string) => Promise<BrowserTabListPayload>;
