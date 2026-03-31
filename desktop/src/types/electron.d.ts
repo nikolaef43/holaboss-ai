@@ -259,6 +259,22 @@ declare global {
     count: number;
   }
 
+  interface ProactiveStatusSnapshotPayload {
+    state: string;
+    detail: string | null;
+    recorded_at: string | null;
+  }
+
+  interface ProactiveAgentStatusPayload {
+    workspace_id: string;
+    proposal_count: number;
+    heartbeat: ProactiveStatusSnapshotPayload;
+    bridge: ProactiveStatusSnapshotPayload;
+    delivery_state: string;
+    delivery_summary: string;
+    delivery_detail: string | null;
+  }
+
   interface DemoTaskProposalRequestPayload {
     workspace_id: string;
     task_name?: string;
@@ -662,6 +678,7 @@ declare global {
       updateCronjob: (jobId: string, payload: CronjobUpdatePayload) => Promise<CronjobRecordPayload>;
       deleteCronjob: (jobId: string) => Promise<{ success: boolean }>;
       listTaskProposals: (workspaceId: string) => Promise<TaskProposalListResponsePayload>;
+      getProactiveStatus: (workspaceId: string) => Promise<ProactiveAgentStatusPayload>;
       updateTaskProposalState: (proposalId: string, state: string) => Promise<TaskProposalStateUpdatePayload>;
       enqueueRemoteDemoTaskProposal: (
         payload: DemoTaskProposalRequestPayload
