@@ -547,8 +547,8 @@ function taskProposalPayload(record: TaskProposalRecord): Record<string, unknown
 }
 
 function resolvedWorkspaceHarness(workspace: WorkspaceRecord): string {
-  const harness = (workspace.harness ?? process.env.SANDBOX_AGENT_HARNESS ?? "opencode").trim();
-  return harness || "opencode";
+  const harness = (workspace.harness ?? process.env.SANDBOX_AGENT_HARNESS ?? "pi").trim();
+  return harness || "pi";
 }
 
 function inferredSessionKind(workspace: WorkspaceRecord, sessionId: string): string {
@@ -1978,7 +1978,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     }
   });
 
-  app.post("/api/v1/internal/workspaces/:workspaceId/opencode-apps/start", async (request, reply) => {
+  app.post("/api/v1/internal/workspaces/:workspaceId/resolved-apps/start", async (request, reply) => {
     if (!isRecord(request.body)) {
       return sendError(reply, 400, "request body must be an object");
     }
@@ -1994,7 +1994,7 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
       if (error instanceof AppLifecycleExecutorError) {
         return sendError(reply, error.statusCode, error.message);
       }
-      return sendError(reply, 500, error instanceof Error ? error.message : "opencode app startup failed");
+      return sendError(reply, 500, error instanceof Error ? error.message : "resolved app startup failed");
     }
   });
 

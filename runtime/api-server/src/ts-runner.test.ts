@@ -19,6 +19,7 @@ import {
 } from "./ts-runner-session-state.js";
 
 const ORIGINAL_SANDBOX_ROOT = process.env.HB_SANDBOX_ROOT;
+const ORIGINAL_EMBEDDED_SKILLS_DIR = process.env.HOLABOSS_EMBEDDED_SKILLS_DIR;
 const ORIGINAL_SANDBOX_RUNTIME_API_URL = process.env.SANDBOX_RUNTIME_API_URL;
 const ORIGINAL_SANDBOX_RUNTIME_API_HOST = process.env.SANDBOX_RUNTIME_API_HOST;
 const ORIGINAL_SANDBOX_RUNTIME_API_PORT = process.env.SANDBOX_RUNTIME_API_PORT;
@@ -28,6 +29,12 @@ afterEach(() => {
     delete process.env.HB_SANDBOX_ROOT;
   } else {
     process.env.HB_SANDBOX_ROOT = ORIGINAL_SANDBOX_ROOT;
+  }
+
+  if (ORIGINAL_EMBEDDED_SKILLS_DIR === undefined) {
+    delete process.env.HOLABOSS_EMBEDDED_SKILLS_DIR;
+  } else {
+    process.env.HOLABOSS_EMBEDDED_SKILLS_DIR = ORIGINAL_EMBEDDED_SKILLS_DIR;
   }
 
   if (ORIGINAL_SANDBOX_RUNTIME_API_URL === undefined) {
@@ -102,7 +109,7 @@ function testDeps(params: {
     stageBrowserTools: () => ({ changed: false, toolIds: [] }),
     stageRuntimeTools: () => ({ changed: false, toolIds: [] }),
     stageSkills: () => ({ changed: false, skillIds: [] }),
-    stageCommands: () => ({ changed: false }),
+    stageCommands: () => ({ changed: false, commandIds: [] }),
     prepareRun: async () => {},
     describeRuntimeStatus: async () => ({
       backendConfigPresent: false,
@@ -203,7 +210,7 @@ test("resolveTsRunnerBootstrapState loads requested and persisted harness sessio
     path.join(workspaceDir, ".holaboss", "harness-session-state.json"),
     JSON.stringify({
       version: 1,
-      harness: "opencode",
+      harness: "pi",
       main_session_id: "persisted-session-1"
     }),
     "utf8"
@@ -216,6 +223,7 @@ test("resolveTsRunnerBootstrapState loads requested and persisted harness sessio
     instruction: "hello",
     context: {
       _sandbox_runtime_exec_v1: {
+        harness: "pi",
         harness_session_id: "requested-session-1"
       }
     },
@@ -224,7 +232,7 @@ test("resolveTsRunnerBootstrapState loads requested and persisted harness sessio
   });
 
   assert.equal(bootstrap.workspaceDir, workspaceDir);
-  assert.equal(bootstrap.harness, "opencode");
+  assert.equal(bootstrap.harness, "pi");
   assert.equal(bootstrap.requestedHarnessSessionId, "requested-session-1");
   assert.equal(bootstrap.persistedHarnessSessionId, "persisted-session-1");
 });
@@ -234,7 +242,7 @@ test("relayTsRunnerEvent persists harness_session_id from terminal events", asyn
   const emitted: Array<{ event_type: string; payload: Record<string, unknown> }> = [];
 
   await relayTsRunnerEvent({
-    harness: "opencode",
+    harness: "pi",
     workspaceDir,
     event: {
       session_id: "session-1",
@@ -261,7 +269,7 @@ test("relayTsRunnerEvent persists harness_session_id from terminal events", asyn
     {
       version: 2,
       harness_sessions: {
-        opencode: {
+        pi: {
           main_session_id: "persisted-session-2"
         }
       }
@@ -273,12 +281,12 @@ test("relayTsRunnerEvent clears persisted harness session ids after run_failed",
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "hb-ts-runner-relay-clear-"));
   persistWorkspaceMainSessionId({
     workspaceDir,
-    harness: "opencode",
+    harness: "pi",
     sessionId: "persisted-session-2"
   });
 
   await relayTsRunnerEvent({
-    harness: "opencode",
+    harness: "pi",
     workspaceDir,
     event: {
       session_id: "session-1",
@@ -295,7 +303,7 @@ test("relayTsRunnerEvent clears persisted harness session ids after run_failed",
     emitEvent: async () => {}
   });
 
-  assert.equal(readWorkspaceMainSessionId({ workspaceDir, harness: "opencode" }), null);
+  assert.equal(readWorkspaceMainSessionId({ workspaceDir, harness: "pi" }), null);
 });
 
 test("runTsRunnerCli relays harness-host events after run_claimed", async () => {
@@ -306,7 +314,14 @@ test("runTsRunnerCli relays harness-host events after run_claimed", async () => 
   const exitCode = await runTsRunnerCli(
     [
       "--request-base64",
-      encodeRequest(baseRequest())
+      encodeRequest({
+        ...baseRequest(),
+        context: {
+          _sandbox_runtime_exec_v1: {
+            harness: "pi",
+          }
+        }
+      })
     ],
     {
       deps: testDeps({
@@ -357,7 +372,7 @@ test("runTsRunnerCli relays harness-host events after run_claimed", async () => 
     {
       version: 2,
       harness_sessions: {
-        opencode: {
+        pi: {
           main_session_id: "persisted-session-3"
         }
       }
@@ -698,6 +713,15 @@ test("runTsRunnerCli includes staged runtime tool ids in the projected extra too
 
   assert.equal(exitCode, 0);
   assert.ok(capturedProjectRequest);
+  assert.equal((capturedProjectRequest as { browser_tools_available: boolean }).browser_tools_available, true);
+  assert.deepEqual(
+    (capturedProjectRequest as { browser_tool_ids: string[] }).browser_tool_ids,
+    ["browser_get_state"]
+  );
+  assert.deepEqual(
+    (capturedProjectRequest as { runtime_tool_ids: string[] }).runtime_tool_ids,
+    ["holaboss_onboarding_complete"]
+  );
   assert.deepEqual(
     (capturedProjectRequest as { extra_tools: string[] }).extra_tools,
     ["browser_get_state", "holaboss_onboarding_complete"]
@@ -759,9 +783,197 @@ test("runTsRunnerCli only stages browser tools for the main session", async () =
   assert.equal(exitCode, 0);
   assert.deepEqual(seenSessionKinds, ["task_proposal"]);
   assert.ok(capturedProjectRequest);
+  assert.equal((capturedProjectRequest as { browser_tools_available: boolean }).browser_tools_available, false);
+  assert.equal((capturedProjectRequest as { session_kind: string | null }).session_kind, "task_proposal");
+  assert.deepEqual((capturedProjectRequest as { browser_tool_ids: string[] }).browser_tool_ids, []);
+  assert.deepEqual(
+    (capturedProjectRequest as { runtime_tool_ids: string[] }).runtime_tool_ids,
+    ["holaboss_onboarding_complete"]
+  );
   assert.deepEqual(
     (capturedProjectRequest as { extra_tools: string[] }).extra_tools,
     ["holaboss_onboarding_complete"]
+  );
+});
+
+test("runTsRunnerCli includes embedded default skill ids and source directories for the pi harness", async () => {
+  const sandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hb-ts-runner-pi-embedded-skills-"));
+  const embeddedSkillsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hb-ts-runner-embedded-skill-root-"));
+  process.env.HB_SANDBOX_ROOT = sandboxRoot;
+  process.env.HOLABOSS_EMBEDDED_SKILLS_DIR = embeddedSkillsRoot;
+  const workspaceDir = path.join(sandboxRoot, "workspace", "workspace-1");
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  const embeddedSkillDir = path.join(embeddedSkillsRoot, "holaboss-runtime");
+  fs.mkdirSync(embeddedSkillDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(embeddedSkillDir, "SKILL.md"),
+    "---\ndescription: Runtime skill\n---\n# Holaboss Runtime\n",
+    "utf8"
+  );
+
+  let capturedProjectRequest: Record<string, unknown> | null = null;
+  let capturedHarnessRequest: Record<string, unknown> | null = null;
+
+  const exitCode = await runTsRunnerCli(
+    [
+      "--request-base64",
+      encodeRequest({
+        ...baseRequest(),
+        context: {
+          _sandbox_runtime_exec_v1: {
+            harness: "pi"
+          }
+        }
+      })
+    ],
+    {
+      deps: {
+        ...testDeps(),
+        projectAgentRuntimeConfig: (request) => {
+          capturedProjectRequest = request as unknown as Record<string, unknown>;
+          return {
+            provider_id: "openai",
+            model_id: "gpt-5.4",
+            mode: "code",
+            system_prompt: "You are concise.",
+            model_client: {
+              model_proxy_provider: "openai_compatible",
+              api_key: "token",
+              base_url: "http://127.0.0.1:4000/openai/v1",
+              default_headers: { "X-Test": "1" }
+            },
+            tools: { read: true, skill: true },
+            workspace_tool_ids: [],
+            workspace_skill_ids: ["holaboss-runtime"],
+            output_schema_member_id: null,
+            output_format: null,
+            workspace_config_checksum: "checksum-1"
+          };
+        },
+        runHarnessHost: async ({ requestPayload }) => {
+          capturedHarnessRequest = requestPayload;
+          return {
+            exitCode: 0,
+            stderr: "",
+            sawEvent: false,
+            terminalEmitted: false,
+            lastSequence: 0
+          };
+        }
+      },
+      io: {
+        stdout: { write() { return true; } } as unknown as NodeJS.WritableStream,
+        stderr: { write() { return true; } } as unknown as NodeJS.WritableStream
+      }
+    }
+  );
+
+  assert.equal(exitCode, 0);
+  assert.ok(capturedProjectRequest);
+  assert.deepEqual(
+    (capturedProjectRequest as { workspace_skill_ids: string[] }).workspace_skill_ids,
+    ["holaboss-runtime"]
+  );
+  assert.ok(capturedHarnessRequest);
+  assert.deepEqual(
+    (capturedHarnessRequest as { workspace_skill_dirs: string[] }).workspace_skill_dirs,
+    [fs.realpathSync(embeddedSkillDir)]
+  );
+});
+
+test("runTsRunnerCli keeps embedded skills authoritative when a workspace skill reuses the same id", async () => {
+  const sandboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hb-ts-runner-pi-embedded-skill-shadow-"));
+  const embeddedSkillsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "hb-ts-runner-embedded-skill-shadow-root-"));
+  process.env.HB_SANDBOX_ROOT = sandboxRoot;
+  process.env.HOLABOSS_EMBEDDED_SKILLS_DIR = embeddedSkillsRoot;
+  const workspaceDir = path.join(sandboxRoot, "workspace", "workspace-1");
+  const workspaceSkillDir = path.join(workspaceDir, "skills", "holaboss-runtime");
+  fs.mkdirSync(workspaceSkillDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(workspaceSkillDir, "SKILL.md"),
+    "---\ndescription: Workspace override\n---\n# Workspace Override\n",
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(workspaceDir, "workspace.yaml"),
+    ['skills:', '  path: "skills"', '  enabled:', '    - "holaboss-runtime"'].join("\n"),
+    "utf8"
+  );
+  const embeddedSkillDir = path.join(embeddedSkillsRoot, "holaboss-runtime");
+  fs.mkdirSync(embeddedSkillDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(embeddedSkillDir, "SKILL.md"),
+    "---\ndescription: Embedded runtime skill\n---\n# Holaboss Runtime\n",
+    "utf8"
+  );
+
+  let capturedProjectRequest: Record<string, unknown> | null = null;
+  let capturedHarnessRequest: Record<string, unknown> | null = null;
+
+  const exitCode = await runTsRunnerCli(
+    [
+      "--request-base64",
+      encodeRequest({
+        ...baseRequest(),
+        context: {
+          _sandbox_runtime_exec_v1: {
+            harness: "pi"
+          }
+        }
+      })
+    ],
+    {
+      deps: {
+        ...testDeps(),
+        projectAgentRuntimeConfig: (request) => {
+          capturedProjectRequest = request as unknown as Record<string, unknown>;
+          return {
+            provider_id: "openai",
+            model_id: "gpt-5.4",
+            mode: "code",
+            system_prompt: "You are concise.",
+            model_client: {
+              model_proxy_provider: "openai_compatible",
+              api_key: "token",
+              base_url: "http://127.0.0.1:4000/openai/v1",
+              default_headers: { "X-Test": "1" }
+            },
+            tools: { read: true, skill: true },
+            workspace_tool_ids: [],
+            workspace_skill_ids: ["holaboss-runtime"],
+            output_schema_member_id: null,
+            output_format: null,
+            workspace_config_checksum: "checksum-1"
+          };
+        },
+        runHarnessHost: async ({ requestPayload }) => {
+          capturedHarnessRequest = requestPayload;
+          return {
+            exitCode: 0,
+            stderr: "",
+            sawEvent: false,
+            terminalEmitted: false,
+            lastSequence: 0
+          };
+        }
+      },
+      io: {
+        stdout: { write() { return true; } } as unknown as NodeJS.WritableStream,
+        stderr: { write() { return true; } } as unknown as NodeJS.WritableStream
+      }
+    }
+  );
+
+  assert.equal(exitCode, 0);
+  assert.ok(capturedProjectRequest);
+  assert.deepEqual(
+    (capturedProjectRequest as { workspace_skill_ids: string[] }).workspace_skill_ids,
+    ["holaboss-runtime"]
+  );
+  assert.ok(capturedHarnessRequest);
+  assert.deepEqual(
+    (capturedHarnessRequest as { workspace_skill_dirs: string[] }).workspace_skill_dirs,
+    [fs.realpathSync(embeddedSkillDir)]
   );
 });
 
@@ -837,6 +1049,7 @@ test("runTsRunnerCli resolves workspace skill ids and source directories for the
 
   assert.equal(exitCode, 0);
   assert.ok(capturedProjectRequest);
+  assert.equal((capturedProjectRequest as { harness_id: string | null }).harness_id, "pi");
   assert.deepEqual((capturedProjectRequest as { workspace_skill_ids: string[] }).workspace_skill_ids, ["alpha"]);
   assert.ok(capturedHarnessRequest);
   assert.deepEqual((capturedHarnessRequest as { workspace_skill_dirs: string[] }).workspace_skill_dirs, [fs.realpathSync(skillDir)]);
@@ -865,7 +1078,7 @@ test("runTsRunnerCli skips workspace command staging for harnesses that do not s
           pluginOverrides: {
             stageCommands: () => {
               stageCommandsCalls += 1;
-              return { changed: false };
+              return { changed: false, commandIds: [] };
             }
           }
         }),

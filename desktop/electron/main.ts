@@ -1930,10 +1930,6 @@ function runtimeWorkspaceRoot() {
   return path.join(runtimeSandboxRoot(), "workspace");
 }
 
-function opencodeSidecarStatePath(workspaceDir: string) {
-  return path.join(workspaceDir, ".holaboss", "opencode-sidecar-state.json");
-}
-
 function processIsAlive(pid: number) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
@@ -1955,65 +1951,6 @@ function terminatePid(pid: number, signal: NodeJS.Signals) {
   } catch {
     // ignore
   }
-}
-
-async function stopEmbeddedRuntimeOpencodeSidecars() {
-  let workspaceEntries: import("node:fs").Dirent[] = [];
-  try {
-    workspaceEntries = await fs.readdir(runtimeWorkspaceRoot(), {
-      withFileTypes: true,
-    });
-  } catch {
-    return;
-  }
-
-  const sidecarPids = new Set<number>();
-  const statePaths: string[] = [];
-
-  for (const entry of workspaceEntries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const statePath = opencodeSidecarStatePath(
-      path.join(runtimeWorkspaceRoot(), entry.name),
-    );
-    statePaths.push(statePath);
-    try {
-      const payload = JSON.parse(await fs.readFile(statePath, "utf-8")) as {
-        sidecar?: { pid?: unknown };
-      };
-      const pid = Number(payload?.sidecar?.pid ?? 0);
-      if (Number.isInteger(pid) && pid > 0) {
-        sidecarPids.add(pid);
-      }
-    } catch {
-      // ignore malformed or missing state
-    }
-  }
-
-  for (const pid of Array.from(sidecarPids).sort(
-    (left, right) => left - right,
-  )) {
-    terminatePid(pid, "SIGTERM");
-  }
-
-  if (sidecarPids.size > 0) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-  }
-
-  for (const pid of Array.from(sidecarPids).sort(
-    (left, right) => left - right,
-  )) {
-    if (processIsAlive(pid)) {
-      terminatePid(pid, "SIGKILL");
-    }
-  }
-
-  await Promise.all(
-    statePaths.map((statePath) =>
-      fs.rm(statePath, { force: true }).catch(() => undefined),
-    ),
-  );
 }
 
 function utcNowIso() {
@@ -5977,17 +5914,17 @@ async function requestRuntimeJson<T>({
 
 function workspaceHarness() {
   return (
-    (process.env.HOLABOSS_RUNTIME_HARNESS || "opencode").trim().toLowerCase() ||
-    "opencode"
+    (process.env.HOLABOSS_RUNTIME_HARNESS || "pi").trim().toLowerCase() ||
+    "pi"
   );
 }
 
 function normalizeRequestedWorkspaceHarness(
   value: string | null | undefined,
 ): string {
-  const normalized = value?.trim().toLowerCase() || "opencode";
-  if (normalized === "opencode" || normalized === "pi") {
-    return normalized;
+  const normalized = value?.trim().toLowerCase() || "pi";
+  if (normalized === "pi") {
+    return "pi";
   }
   throw new Error(`Unsupported workspace harness '${value}'.`);
 }
@@ -6876,6 +6813,58 @@ function extractSkillMetadata(
   };
 }
 
+async function readSkillCatalogFromRoot(params: {
+  skillsRoot: string | null;
+  enabledSkillIds: string[];
+}): Promise<WorkspaceSkillRecordPayload[]> {
+  if (!params.skillsRoot) {
+    return [];
+  }
+
+  let directoryEntries;
+  try {
+    directoryEntries = await fs.readdir(params.skillsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  return (
+    await Promise.all(
+      directoryEntries
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => {
+          const skillId = normalizeWorkspaceSkillId(entry.name);
+          if (!skillId) {
+            return null;
+          }
+          const sourceDir = path.join(params.skillsRoot!, entry.name);
+          const skillFilePath = path.join(sourceDir, "SKILL.md");
+          try {
+            const [content, stats] = await Promise.all([
+              fs.readFile(skillFilePath, "utf-8"),
+              fs.stat(skillFilePath),
+            ]);
+            const metadata = extractSkillMetadata(content, skillId);
+            return {
+              skill_id: skillId,
+              source_dir: sourceDir,
+              skill_file_path: skillFilePath,
+              title: metadata.title,
+              summary: metadata.summary,
+              enabled:
+                params.enabledSkillIds.length === 0
+                  ? true
+                  : params.enabledSkillIds.includes(skillId),
+              modified_at: stats.mtime.toISOString(),
+            } satisfies WorkspaceSkillRecordPayload;
+          } catch {
+            return null;
+          }
+        }),
+    )
+  ).filter((skill): skill is WorkspaceSkillRecordPayload => Boolean(skill));
+}
+
 async function listWorkspaceSkills(
   workspaceId: string,
 ): Promise<WorkspaceSkillListResponsePayload> {
@@ -6896,93 +6885,55 @@ async function listWorkspaceSkills(
     path.resolve(workspaceRoot),
     skillsPath,
   );
-  if (
+  const workspaceSkillsPath =
     path.isAbsolute(relativePath) ||
     relativeToWorkspace.startsWith("..") ||
     path.isAbsolute(relativeToWorkspace)
-  ) {
-    return {
-      workspace_id: workspaceId,
-      workspace_root: workspaceRoot,
-      skills_path: skillsPath,
-      configured_path: configuredPath,
-      enabled_skill_ids: config.enabledSkillIds,
-      missing_enabled_skill_ids: [...config.enabledSkillIds],
-      skills: [],
-    };
-  }
+      ? null
+      : skillsPath;
 
-  let directoryEntries;
-  try {
-    directoryEntries = await fs.readdir(skillsPath, { withFileTypes: true });
-  } catch {
-    return {
-      workspace_id: workspaceId,
-      workspace_root: workspaceRoot,
-      skills_path: skillsPath,
-      configured_path: configuredPath,
-      enabled_skill_ids: config.enabledSkillIds,
-      missing_enabled_skill_ids: [...config.enabledSkillIds],
-      skills: [],
-    };
-  }
+  const workspaceSkills = await readSkillCatalogFromRoot({
+    skillsRoot: workspaceSkillsPath,
+    enabledSkillIds: config.enabledSkillIds,
+  });
 
-  const skills = (
-    await Promise.all(
-      directoryEntries
-        .filter((entry) => entry.isDirectory())
-        .map(async (entry) => {
-          const skillId = normalizeWorkspaceSkillId(entry.name);
-          if (!skillId) {
-            return null;
-          }
-          const sourceDir = path.join(skillsPath, entry.name);
-          const skillFilePath = path.join(sourceDir, "SKILL.md");
-          try {
-            const [content, stats] = await Promise.all([
-              fs.readFile(skillFilePath, "utf-8"),
-              fs.stat(skillFilePath),
-            ]);
-            const metadata = extractSkillMetadata(content, skillId);
-            return {
-              skill_id: skillId,
-              source_dir: sourceDir,
-              skill_file_path: skillFilePath,
-              title: metadata.title,
-              summary: metadata.summary,
-              enabled:
-                config.enabledSkillIds.length === 0
-                  ? true
-                  : config.enabledSkillIds.includes(skillId),
-              modified_at: stats.mtime.toISOString(),
-            } satisfies WorkspaceSkillRecordPayload;
-          } catch {
-            return null;
-          }
-        }),
-    )
-  ).filter((skill): skill is WorkspaceSkillRecordPayload => Boolean(skill));
+  const skillById = new Map(
+    workspaceSkills.map((skill) => [skill.skill_id, skill] as const),
+  );
+  const orderedSkillIds =
+    config.enabledSkillIds.length > 0
+      ? config.enabledSkillIds
+      : workspaceSkills.map((skill) => skill.skill_id);
+
+  const skills = orderedSkillIds
+    .map((skillId) => skillById.get(skillId) ?? null)
+    .filter((skill): skill is WorkspaceSkillRecordPayload => Boolean(skill));
 
   const configuredOrder = new Map(
     config.enabledSkillIds.map((skillId, index) => [skillId, index] as const),
   );
-  skills.sort((left, right) => {
-    const leftRank =
-      configuredOrder.get(left.skill_id) ?? Number.MAX_SAFE_INTEGER;
-    const rightRank =
-      configuredOrder.get(right.skill_id) ?? Number.MAX_SAFE_INTEGER;
-    if (leftRank !== rightRank) {
-      return leftRank - rightRank;
-    }
-    if (left.enabled !== right.enabled) {
-      return left.enabled ? -1 : 1;
-    }
-    return left.title.localeCompare(right.title, undefined, {
-      sensitivity: "base",
+  if (config.enabledSkillIds.length === 0) {
+    skills.sort((left, right) => {
+      return left.title.localeCompare(right.title, undefined, {
+        sensitivity: "base",
+      });
     });
-  });
+  } else {
+    skills.sort((left, right) => {
+      const leftRank =
+        configuredOrder.get(left.skill_id) ?? Number.MAX_SAFE_INTEGER;
+      const rightRank =
+        configuredOrder.get(right.skill_id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return left.title.localeCompare(right.title, undefined, {
+        sensitivity: "base",
+      });
+    });
+  }
 
-  const discoveredIds = new Set(skills.map((skill) => skill.skill_id));
+  const discoveredIds = new Set(workspaceSkills.map((skill) => skill.skill_id));
   const missingEnabledSkillIds = config.enabledSkillIds.filter(
     (skillId) => !discoveredIds.has(skillId),
   );
@@ -8024,7 +7975,7 @@ async function refreshRuntimeStatus() {
     ? path.join(runtimeRoot, "bin", "sandbox-runtime")
     : null;
   const sandboxRoot = runtimeSandboxRoot();
-  const harness = process.env.HOLABOSS_RUNTIME_HARNESS || "opencode";
+  const harness = process.env.HOLABOSS_RUNTIME_HARNESS || "pi";
   const workflowBackend =
     process.env.HOLABOSS_RUNTIME_WORKFLOW_BACKEND || "remote_api";
   const url = `http://127.0.0.1:${RUNTIME_API_PORT}`;
@@ -8079,7 +8030,6 @@ async function stopEmbeddedRuntime() {
   const running = runtimeProcess;
   runtimeProcess = null;
   if (!running) {
-    await stopEmbeddedRuntimeOpencodeSidecars();
     if (
       runtimeStatus.status === "running" ||
       runtimeStatus.status === "starting"
@@ -8143,8 +8093,6 @@ async function stopEmbeddedRuntime() {
       settle();
     }
   });
-
-  await stopEmbeddedRuntimeOpencodeSidecars();
 }
 
 async function startEmbeddedRuntime() {
@@ -8157,7 +8105,7 @@ async function startEmbeddedRuntime() {
     ? path.join(runtimeRoot, "bin", "sandbox-runtime")
     : null;
   const sandboxRoot = runtimeSandboxRoot();
-  const harness = process.env.HOLABOSS_RUNTIME_HARNESS || "opencode";
+  const harness = process.env.HOLABOSS_RUNTIME_HARNESS || "pi";
   const workflowBackend =
     process.env.HOLABOSS_RUNTIME_WORKFLOW_BACKEND || "remote_api";
   const url = `http://127.0.0.1:${RUNTIME_API_PORT}`;
@@ -8227,7 +8175,6 @@ async function startEmbeddedRuntime() {
       HB_SANDBOX_ROOT: sandboxRoot,
       SANDBOX_AGENT_BIND_HOST: "127.0.0.1",
       SANDBOX_AGENT_BIND_PORT: String(RUNTIME_API_PORT),
-      OPENCODE_SERVER_HOST: "127.0.0.1",
       HOLABOSS_EMBEDDED_RUNTIME: "1",
       SANDBOX_AGENT_HARNESS: harness,
       HOLABOSS_RUNTIME_WORKFLOW_BACKEND: workflowBackend,
@@ -12225,7 +12172,7 @@ app.whenReady().then(async () => {
     status: "starting",
     url: `http://127.0.0.1:${RUNTIME_API_PORT}`,
     sandboxRoot: runtimeSandboxRoot(),
-    harness: process.env.HOLABOSS_RUNTIME_HARNESS || "opencode",
+    harness: process.env.HOLABOSS_RUNTIME_HARNESS || "pi",
     lastError: "",
   });
   emitRuntimeState();
