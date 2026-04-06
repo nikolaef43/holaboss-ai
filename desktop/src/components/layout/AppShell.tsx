@@ -149,6 +149,11 @@ type ChatSessionOpenRequest = {
   requestKey: number;
 };
 
+type ChatComposerPrefillRequest = {
+  text: string;
+  requestKey: number;
+};
+
 type WorkspaceOutputNavigationTarget =
   | {
       type: "app";
@@ -557,6 +562,8 @@ function AppShellContent() {
   } | null>(null);
   const [chatSessionOpenRequest, setChatSessionOpenRequest] =
     useState<ChatSessionOpenRequest | null>(null);
+  const [chatComposerPrefillRequest, setChatComposerPrefillRequest] =
+    useState<ChatComposerPrefillRequest | null>(null);
   const [fileExplorerFocusRequest, setFileExplorerFocusRequest] =
     useState<FileExplorerFocusRequest | null>(null);
   const [activeChatSessionId, setActiveChatSessionId] = useState<string | null>(
@@ -598,6 +605,10 @@ function AppShellContent() {
   ] = useState(false);
   const [proactiveTaskProposalsError, setProactiveTaskProposalsError] =
     useState("");
+  const [proactiveStatus, setProactiveStatus] =
+    useState<ProactiveAgentStatusPayload | null>(null);
+  const [isLoadingProactiveStatus, setIsLoadingProactiveStatus] =
+    useState(false);
   const [proposalAction, setProposalAction] = useState<{
     proposalId: string;
     action: "accept" | "dismiss";
@@ -1208,6 +1219,32 @@ function AppShellContent() {
     }
   }
 
+  async function refreshProactiveStatus(options?: { silent?: boolean }) {
+    if (!selectedWorkspaceId || !selectedWorkspace) {
+      setProactiveStatus(null);
+      setIsLoadingProactiveStatus(false);
+      return;
+    }
+
+    if (!options?.silent) {
+      setIsLoadingProactiveStatus(true);
+    }
+    try {
+      const response = await window.electronAPI.workspace.getProactiveStatus(
+        selectedWorkspace.id,
+      );
+      setProactiveStatus(response);
+    } catch (error) {
+      if (!options?.silent) {
+        setTaskProposalStatusMessage(normalizeErrorMessage(error));
+      }
+    } finally {
+      if (!options?.silent) {
+        setIsLoadingProactiveStatus(false);
+      }
+    }
+  }
+
   async function triggerRemoteTaskProposal() {
     if (!selectedWorkspaceId) {
       return;
@@ -1216,13 +1253,16 @@ function AppShellContent() {
     setTaskProposalStatusMessage("");
     try {
       const response =
-        await window.electronAPI.workspace.enqueueRemoteDemoTaskProposal({
+        await window.electronAPI.workspace.requestRemoteTaskProposalGeneration({
           workspace_id: selectedWorkspaceId,
         });
-      const detail = `Remote proactive job queued. Pending cloud jobs: ${response.pending_count}.`;
-      setTaskProposalStatusMessage(detail);
+      setTaskProposalStatusMessage(
+        response.accepted ? "" : "Suggestions are unavailable right now.",
+      );
+      void refreshProactiveStatus();
       window.setTimeout(() => {
         void refreshTaskProposals();
+        void refreshProactiveStatus({ silent: true });
       }, 1500);
     } catch (error) {
       setTaskProposalStatusMessage(normalizeErrorMessage(error));
@@ -1337,6 +1377,48 @@ function AppShellContent() {
     selectedWorkspaceId,
   ]);
 
+  useEffect(() => {
+    if (!selectedWorkspaceId || !selectedWorkspace) {
+      setProactiveStatus(null);
+      setIsLoadingProactiveStatus(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    const load = async (options?: { silent?: boolean }) => {
+      if (!options?.silent && !cancelled) {
+        setIsLoadingProactiveStatus(true);
+      }
+      try {
+        const response = await window.electronAPI.workspace.getProactiveStatus(
+          selectedWorkspace.id,
+        );
+        if (!cancelled) {
+          setProactiveStatus(response);
+        }
+      } catch (error) {
+        if (!cancelled && !options?.silent) {
+          setTaskProposalStatusMessage(normalizeErrorMessage(error));
+        }
+      } finally {
+        if (!cancelled && !options?.silent) {
+          setIsLoadingProactiveStatus(false);
+        }
+      }
+    };
+
+    void load();
+    const timer = window.setInterval(() => {
+      void load({ silent: true });
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedWorkspace, selectedWorkspaceId]);
+
   const handleDismissUpdate = () => {
     void window.electronAPI.appUpdate.dismiss(
       appUpdateStatus?.releaseTag ?? null,
@@ -1398,6 +1480,37 @@ function AppShellContent() {
       requestKey: Date.now(),
     });
     setChatFocusRequestKey((current) => current + 1);
+  }, []);
+
+  const handleCreateScheduleInChat = useCallback(() => {
+    const mainSessionId = (selectedWorkspace?.main_session_id || "").trim();
+
+    setActiveLeftRailItem("space");
+    setSpaceVisibility((previous) => ({
+      ...previous,
+      agent: true,
+    }));
+    setAgentView({ type: "chat" });
+    setChatSessionJumpRequest(null);
+    setChatSessionOpenRequest((previous) =>
+      mainSessionId
+        ? {
+            sessionId: mainSessionId,
+            requestKey: (previous?.requestKey ?? 0) + 1,
+          }
+        : null,
+    );
+    setChatComposerPrefillRequest((previous) => ({
+      text: "Create a cronjob for ",
+      requestKey: (previous?.requestKey ?? 0) + 1,
+    }));
+    setChatFocusRequestKey((current) => current + 1);
+  }, [selectedWorkspace?.main_session_id]);
+
+  const handleChatComposerPrefillConsumed = useCallback((requestKey: number) => {
+    setChatComposerPrefillRequest((current) =>
+      current?.requestKey === requestKey ? null : current,
+    );
   }, []);
 
   const handleOpenWorkspaceOutput = useCallback(
@@ -1528,6 +1641,8 @@ function AppShellContent() {
           sessionJumpSessionId={chatSessionJumpRequest?.sessionId ?? null}
           sessionJumpRequestKey={chatSessionJumpRequest?.requestKey ?? 0}
           sessionOpenRequest={chatSessionOpenRequest}
+          composerPrefillRequest={chatComposerPrefillRequest}
+          onComposerPrefillConsumed={handleChatComposerPrefillConsumed}
           onActiveSessionIdChange={setActiveChatSessionId}
         />
       );
@@ -1954,6 +2069,7 @@ function AppShellContent() {
                   <div className="h-full min-h-0 overflow-hidden rounded-[var(--radius-xl)]">
                     <AutomationsPane
                       onOpenRunSession={handleOpenAutomationRunSession}
+                      onCreateSchedule={handleCreateScheduleInChat}
                     />
                   </div>
                 ) : activeLeftRailItem === "marketplace" ? (
@@ -1993,7 +2109,7 @@ function AppShellContent() {
                       <button
                         type="button"
                         onClick={() => openOperationsDrawerTab("running")}
-                        aria-label="Open running panel"
+                        aria-label="Open sub-sessions panel"
                         className="inline-flex h-8 w-8 items-center justify-center rounded-[12px] border border-border/45 text-muted-foreground transition-all duration-200 hover:border-primary/45 hover:text-primary active:scale-95"
                       >
                         <Clock3 size={13} />
@@ -2018,6 +2134,8 @@ function AppShellContent() {
                   activeTab={activeOperationsTab}
                   onTabChange={setActiveOperationsTab}
                   proposals={taskProposals}
+                  proactiveStatus={proactiveStatus}
+                  isLoadingProactiveStatus={isLoadingProactiveStatus}
                   proactiveTaskProposalsEnabled={proactiveTaskProposalsEnabled}
                   isUpdatingProactiveTaskProposalsEnabled={
                     isLoadingProactiveTaskProposalsEnabled ||
@@ -2028,7 +2146,6 @@ function AppShellContent() {
                   isTriggeringProposal={isTriggeringTaskProposal}
                   proposalStatusMessage={taskProposalStatusMessage}
                   proposalAction={proposalAction}
-                  onRefreshProposals={() => void refreshTaskProposals()}
                   onTriggerProposal={() => void triggerRemoteTaskProposal()}
                   onProactiveTaskProposalsEnabledChange={(enabled) =>
                     void handleProactiveTaskProposalsEnabledChange(enabled)
@@ -2043,6 +2160,7 @@ function AppShellContent() {
                   activeRunningSessionId={activeChatSessionId}
                   hasWorkspace={hasSelectedWorkspace}
                   selectedWorkspaceId={selectedWorkspaceId}
+                  selectedWorkspaceName={selectedWorkspace?.name || null}
                   mainSessionId={
                     (selectedWorkspace?.main_session_id || "").trim() || null
                   }
