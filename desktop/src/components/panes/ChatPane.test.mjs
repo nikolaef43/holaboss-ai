@@ -116,12 +116,69 @@ test("chat trace summary treats recovered tool errors separately from terminal r
   );
 });
 
-test("chat trace summary keeps a live run in progress even after completed tool steps exist", async () => {
+test("chat trace summary keeps a live run in progress when no active step label is available", async () => {
   const source = await readFile(sourcePath, "utf8");
 
   assert.match(source, /<TraceStepGroup[\s\S]*live=\{live\}/);
   assert.match(source, /const groupIsLive = live && !groupHasTerminalError;/);
-  assert.match(source, /groupIsLive\s*\?\s*`Working through \$\{stepLabel\}\.\.\.`/);
+  assert.match(
+    source,
+    /activeStep[\s\S]*groupIsLive\s*\?\s*`Working through \$\{stepLabel\}\.\.\.`/,
+  );
+});
+
+test("chat trace collapsed summary surfaces the current active step", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(
+    source,
+    /const activeStep =[\s\S]*\.find\(\s*\(step\) => step\.status === "running" \|\| step\.status === "waiting",/,
+  );
+  assert.match(
+    source,
+    /const latestStep = steps\.length > 0 \? steps\[steps\.length - 1\] : null;/,
+  );
+  assert.match(
+    source,
+    /const summaryStep = activeStep \?\? \(groupIsLive \? latestStep : null\);/,
+  );
+  assert.match(
+    source,
+    /summaryStep[\s\S]*summaryStep === activeStep \|\| summaryStep\.status === "waiting"[\s\S]*`\$\{traceStatusLabel\(summaryStep\.status\)\}: \$\{summaryStep\.title\}`[\s\S]*groupIsLive[\s\S]*summaryStep\.title/,
+  );
+});
+
+test("chat pane keeps compaction restore inside bootstrap status instead of a standalone phase card", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(
+    source,
+    /eventType === "run_claimed" \|\|\s*eventType === "compaction_restored" \|\|\s*eventType === "run_started"[\s\S]*setLiveAgentStatus\("Checking workspace context"\);/,
+  );
+  assert.doesNotMatch(source, /Preparing workspace context\.\.\./);
+  assert.doesNotMatch(source, /title:\s*"Restored compacted context"/);
+  assert.doesNotMatch(source, /id:\s*"phase:compaction-restored"/);
+});
+
+test("chat pane renders live placeholder status as faint text with animated trailing dots", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(source, /aria-live="polite"/);
+  assert.match(source, /const normalizedStatus = status\.replace\(\/\\\.\+\$\/, ""\)\.trim\(\);/);
+  assert.match(
+    source,
+    /className="inline-flex items-baseline gap-0\.5 text-\[12px\] leading-6 text-muted-foreground\/72"/,
+  );
+  assert.match(source, /function LiveStatusEllipsis\(\)/);
+  assert.match(source, /@keyframes status-dot-wave/);
+  assert.match(source, /30% \{ transform: translateY\(-3px\); \}/);
+  assert.match(source, /animation: "status-dot-wave 1200ms ease-in-out infinite"/);
+  assert.match(source, /animationDelay: `\$\{index \* 120\}ms`/);
+  assert.doesNotMatch(source, /Preparing first question\.\.\./);
+  assert.doesNotMatch(source, /Queued\.\.\./);
+  assert.doesNotMatch(source, /Working\.\.\./);
+  assert.doesNotMatch(source, /Checking workspace context\.\.\./);
+  assert.doesNotMatch(source, /Thinking\.\.\./);
 });
 
 test("chat trace tool errors surface stderr text instead of a generic error label", async () => {

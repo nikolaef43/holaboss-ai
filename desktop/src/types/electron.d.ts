@@ -50,6 +50,10 @@ declare global {
     createdAt: string;
   }
 
+  interface FileSystemMutationPayload {
+    absolutePath: string;
+  }
+
   interface BrowserBoundsPayload {
     x: number;
     y: number;
@@ -347,6 +351,39 @@ declare global {
     enabled: boolean;
     holaboss_user_id: string;
     sandbox_id: string;
+  }
+
+  interface ProactiveHeartbeatWorkspacePayload {
+    workspace_id: string;
+    workspace_name: string | null;
+    enabled: boolean;
+    last_seen_at: string | null;
+  }
+
+  interface ProactiveHeartbeatConfigPayload {
+    holaboss_user_id: string;
+    sandbox_id: string;
+    has_schedule: boolean;
+    cron: string;
+    enabled: boolean;
+    last_run_at: string | null;
+    next_run_at: string | null;
+    workspaces: ProactiveHeartbeatWorkspacePayload[];
+  }
+
+  interface ProactiveHeartbeatConfigUpdatePayload {
+    cron?: string;
+    enabled?: boolean;
+    holaboss_user_id?: string;
+    sandbox_id?: string;
+  }
+
+  interface ProactiveHeartbeatWorkspaceUpdatePayload {
+    workspace_id: string;
+    workspace_name?: string | null;
+    enabled: boolean;
+    holaboss_user_id?: string;
+    sandbox_id?: string;
   }
 
   interface TaskProposalStateUpdatePayload {
@@ -1030,6 +1067,8 @@ declare global {
       listDirectory: (targetPath?: string | null, workspaceId?: string | null) => Promise<LocalDirectoryResponse>;
       readFilePreview: (targetPath: string, workspaceId?: string | null) => Promise<FilePreviewPayload>;
       writeTextFile: (targetPath: string, content: string, workspaceId?: string | null) => Promise<FilePreviewPayload>;
+      renamePath: (targetPath: string, nextName: string, workspaceId?: string | null) => Promise<FileSystemMutationPayload>;
+      deletePath: (targetPath: string, workspaceId?: string | null) => Promise<{ deleted: boolean }>;
       getBookmarks: (workspaceId?: string | null) => Promise<FileBookmarkPayload[]>;
       addBookmark: (targetPath: string, label?: string, workspaceId?: string | null) => Promise<FileBookmarkPayload[]>;
       removeBookmark: (bookmarkId: string) => Promise<FileBookmarkPayload[]>;
@@ -1125,6 +1164,13 @@ declare global {
       setProactiveTaskProposalPreference: (
         payload: ProactiveTaskProposalPreferenceUpdatePayload
       ) => Promise<ProactiveTaskProposalPreferencePayload>;
+      getProactiveHeartbeatConfig: () => Promise<ProactiveHeartbeatConfigPayload>;
+      setProactiveHeartbeatConfig: (
+        payload: ProactiveHeartbeatConfigUpdatePayload
+      ) => Promise<ProactiveHeartbeatConfigPayload>;
+      setProactiveHeartbeatWorkspaceEnabled: (
+        payload: ProactiveHeartbeatWorkspaceUpdatePayload
+      ) => Promise<ProactiveHeartbeatConfigPayload>;
       updateTaskProposalState: (proposalId: string, state: string) => Promise<TaskProposalStateUpdatePayload>;
       requestRemoteTaskProposalGeneration: (
         payload: RemoteTaskProposalGenerationRequestPayload

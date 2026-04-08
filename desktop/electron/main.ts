@@ -12,9 +12,13 @@ import {
   app,
   BrowserView,
   BrowserWindow,
+  Menu,
+  clipboard,
   dialog,
   DownloadItem,
   ipcMain,
+  type ContextMenuParams,
+  type MenuItemConstructorOptions,
   nativeImage,
   screen,
   session,
@@ -171,6 +175,10 @@ interface FileBookmarkPayload {
   createdAt: string;
 }
 
+interface FileSystemMutationPayload {
+  absolutePath: string;
+}
+
 interface BrowserBoundsPayload {
   x: number;
   y: number;
@@ -225,6 +233,14 @@ interface BrowserWorkspaceState {
   downloads: BrowserDownloadPayload[];
   history: BrowserHistoryEntryPayload[];
   downloadTrackingRegistered: boolean;
+  pendingDownloadOverrides: BrowserDownloadOverride[];
+}
+
+interface BrowserDownloadOverride {
+  url: string;
+  defaultPath: string;
+  dialogTitle: string;
+  buttonLabel: string;
 }
 
 interface BrowserBookmarkPayload {
@@ -1743,6 +1759,55 @@ interface ProactiveTaskProposalPreferencePayload {
   enabled: boolean;
   holaboss_user_id: string;
   sandbox_id: string;
+}
+
+interface ProactiveHeartbeatWorkspacePayload {
+  workspace_id: string;
+  workspace_name: string | null;
+  enabled: boolean;
+  last_seen_at: string | null;
+}
+
+interface ProactiveHeartbeatConfigPayload {
+  holaboss_user_id: string;
+  sandbox_id: string;
+  has_schedule: boolean;
+  cron: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  workspaces: ProactiveHeartbeatWorkspacePayload[];
+}
+
+interface ProactiveHeartbeatConfigUpdatePayload {
+  cron?: string;
+  enabled?: boolean;
+  holaboss_user_id?: string;
+  sandbox_id?: string;
+}
+
+interface ProactiveHeartbeatWorkspaceUpdatePayload {
+  workspace_id: string;
+  workspace_name?: string | null;
+  enabled: boolean;
+  holaboss_user_id?: string;
+  sandbox_id?: string;
+}
+
+interface ProactiveHeartbeatCronjobRecordResponsePayload {
+  sandbox_id: string;
+  holaboss_user_id: string;
+  cron: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  next_run_at: string | null;
+}
+
+interface ProactiveHeartbeatConfigResponsePayload {
+  holaboss_user_id: string;
+  sandbox_id: string;
+  cronjob: ProactiveHeartbeatCronjobRecordResponsePayload | null;
+  workspaces: ProactiveHeartbeatWorkspacePayload[];
 }
 
 interface TaskProposalStateUpdatePayload {
@@ -6703,6 +6768,8 @@ async function proactivePreferenceScopeFromRuntimeConfig(): Promise<{
   return { holabossUserId, sandboxId };
 }
 
+const DEFAULT_PROACTIVE_HEARTBEAT_CRON = "0 9 * * *";
+
 function assertProactivePreferenceScopedToInstance(
   response: ProactiveTaskProposalPreferencePayload,
   expected: { holabossUserId: string; sandboxId: string },
@@ -6798,6 +6865,187 @@ async function getProactiveTaskProposalPreference(): Promise<ProactiveTaskPropos
       holaboss_user_id: holabossUserId,
       sandbox_id: sandboxId,
     };
+  }
+}
+
+function assertProactiveHeartbeatScopedToInstance(
+  response: ProactiveHeartbeatConfigResponsePayload,
+  expected: { holabossUserId: string; sandboxId: string },
+) {
+  const responseUserId = (response.holaboss_user_id || "").trim();
+  const responseSandboxId = (response.sandbox_id || "").trim();
+  if (!responseUserId || !responseSandboxId) {
+    throw new Error(
+      "Proactive heartbeat response is missing user/instance scope.",
+    );
+  }
+  if (
+    responseUserId !== expected.holabossUserId ||
+    responseSandboxId !== expected.sandboxId
+  ) {
+    throw new Error(
+      "Proactive heartbeat scope mismatch for current desktop instance.",
+    );
+  }
+}
+
+function normalizeProactiveHeartbeatConfig(
+  response: ProactiveHeartbeatConfigResponsePayload,
+): ProactiveHeartbeatConfigPayload {
+  return {
+    holaboss_user_id: (response.holaboss_user_id || "").trim(),
+    sandbox_id: (response.sandbox_id || "").trim(),
+    has_schedule: Boolean(response.cronjob),
+    cron:
+      (response.cronjob?.cron || "").trim() || DEFAULT_PROACTIVE_HEARTBEAT_CRON,
+    enabled: response.cronjob?.enabled !== false,
+    last_run_at: response.cronjob?.last_run_at || null,
+    next_run_at: response.cronjob?.next_run_at || null,
+    workspaces: (response.workspaces || []).map((workspace) => ({
+      workspace_id: (workspace.workspace_id || "").trim(),
+      workspace_name: (workspace.workspace_name || "").trim() || null,
+      enabled: workspace.enabled !== false,
+      last_seen_at: workspace.last_seen_at || null,
+    })),
+  };
+}
+
+async function listLocalProactiveHeartbeatWorkspaces(): Promise<
+  Array<{ workspace_id: string; workspace_name: string | null }>
+> {
+  const response = await listWorkspacesViaRuntime();
+  return response.items
+    .map((workspace) => ({
+      workspace_id: workspace.id.trim(),
+      workspace_name: (workspace.name || "").trim() || null,
+    }))
+    .filter((workspace) => Boolean(workspace.workspace_id));
+}
+
+async function syncCurrentProactiveHeartbeatWorkspaces(
+  scope: { holabossUserId: string; sandboxId: string },
+): Promise<ProactiveHeartbeatConfigPayload> {
+  try {
+    const workspaces = await listLocalProactiveHeartbeatWorkspaces();
+    const response =
+      await requestControlPlaneJson<ProactiveHeartbeatConfigResponsePayload>({
+        service: "proactive",
+        method: "POST",
+        path: "/api/v1/proactive/heartbeat-cronjobs/current/workspaces/sync",
+        payload: {
+          holaboss_user_id: scope.holabossUserId,
+          sandbox_id: scope.sandboxId,
+          workspaces,
+        },
+      });
+    assertProactiveHeartbeatScopedToInstance(response, scope);
+    return normalizeProactiveHeartbeatConfig(response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("Service not found") || message.includes("fetch failed")) {
+      throw new Error(
+        "Proactive service is not reachable. Check your network or backend configuration.",
+      );
+    }
+    throw error;
+  }
+}
+
+async function getProactiveHeartbeatConfig(): Promise<ProactiveHeartbeatConfigPayload> {
+  try {
+    const scope = await proactivePreferenceScopeFromRuntimeConfig();
+    return await syncCurrentProactiveHeartbeatWorkspaces(scope);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("Proactive auth is missing")) {
+      throw error;
+    }
+    const runtimeConfig = await readRuntimeConfigFile();
+    const holabossUserId =
+      typeof (runtimeConfig as { user_id?: unknown }).user_id === "string"
+        ? ((runtimeConfig as { user_id: string }).user_id || "").trim()
+        : "";
+    const sandboxId =
+      typeof (runtimeConfig as { sandbox_id?: unknown }).sandbox_id === "string"
+        ? ((runtimeConfig as { sandbox_id: string }).sandbox_id || "").trim()
+        : "";
+    return {
+      holaboss_user_id: holabossUserId,
+      sandbox_id: sandboxId,
+      has_schedule: false,
+      cron: DEFAULT_PROACTIVE_HEARTBEAT_CRON,
+      enabled: false,
+      last_run_at: null,
+      next_run_at: null,
+      workspaces: [],
+    };
+  }
+}
+
+async function setProactiveHeartbeatConfig(
+  payload: ProactiveHeartbeatConfigUpdatePayload,
+): Promise<ProactiveHeartbeatConfigPayload> {
+  const scope = await proactivePreferenceScopeFromRuntimeConfig();
+  await syncCurrentProactiveHeartbeatWorkspaces(scope);
+  try {
+    const response =
+      await requestControlPlaneJson<ProactiveHeartbeatConfigResponsePayload>({
+        service: "proactive",
+        method: "POST",
+        path: "/api/v1/proactive/heartbeat-cronjobs/current",
+        payload: {
+          holaboss_user_id:
+            payload.holaboss_user_id?.trim() || scope.holabossUserId,
+          sandbox_id: payload.sandbox_id?.trim() || scope.sandboxId,
+          cron: payload.cron?.trim() || undefined,
+          enabled: payload.enabled,
+        },
+      });
+    assertProactiveHeartbeatScopedToInstance(response, scope);
+    return normalizeProactiveHeartbeatConfig(response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("Service not found") || message.includes("fetch failed")) {
+      throw new Error(
+        "Proactive service is not reachable. Check your network or backend configuration.",
+      );
+    }
+    throw error;
+  }
+}
+
+async function setProactiveHeartbeatWorkspaceEnabled(
+  payload: ProactiveHeartbeatWorkspaceUpdatePayload,
+): Promise<ProactiveHeartbeatConfigPayload> {
+  const scope = await proactivePreferenceScopeFromRuntimeConfig();
+  const workspaceId = payload.workspace_id.trim();
+  if (!workspaceId) {
+    throw new Error("workspace_id is required");
+  }
+  try {
+    const response =
+      await requestControlPlaneJson<ProactiveHeartbeatConfigResponsePayload>({
+        service: "proactive",
+        method: "POST",
+        path: `/api/v1/proactive/heartbeat-cronjobs/current/workspaces/${encodeURIComponent(workspaceId)}`,
+        payload: {
+          holaboss_user_id:
+            payload.holaboss_user_id?.trim() || scope.holabossUserId,
+          sandbox_id: payload.sandbox_id?.trim() || scope.sandboxId,
+          workspace_name: payload.workspace_name?.trim() || undefined,
+          enabled: payload.enabled !== false,
+        },
+      });
+    assertProactiveHeartbeatScopedToInstance(response, scope);
+    return normalizeProactiveHeartbeatConfig(response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("Service not found") || message.includes("fetch failed")) {
+      throw new Error(
+        "Proactive service is not reachable. Check your network or backend configuration.",
+      );
+    }
+    throw error;
   }
 }
 
@@ -7673,6 +7921,33 @@ function requestedWorkspaceTemplateMode(
 
 function workspaceDirectoryPath(workspaceId: string) {
   return path.join(runtimeWorkspaceRoot(), workspaceId);
+}
+
+function resolveWorkspaceDownloadTargetPath(
+  workspaceId: string,
+  filename: string,
+): string {
+  const downloadsDir = path.join(
+    workspaceDirectoryPath(workspaceId),
+    "Downloads",
+  );
+  mkdirSync(downloadsDir, { recursive: true });
+
+  const sanitizedFilename = sanitizeAttachmentName(filename || "download");
+  const parsed = path.parse(sanitizedFilename);
+  const basename = parsed.name || "download";
+  const extension = parsed.ext || "";
+
+  let candidate = `${basename}${extension}`;
+  let candidatePath = path.join(downloadsDir, candidate);
+  let index = 2;
+  while (existsSync(candidatePath)) {
+    candidate = `${basename}-${index}${extension}`;
+    candidatePath = path.join(downloadsDir, candidate);
+    index += 1;
+  }
+
+  return candidatePath;
 }
 
 function sanitizeAttachmentName(name: string): string {
@@ -10382,6 +10657,7 @@ function createBrowserWorkspaceState(
     downloads: [],
     history: [],
     downloadTrackingRegistered: false,
+    pendingDownloadOverrides: [],
   };
 }
 
@@ -10570,8 +10846,12 @@ function getFilePreviewKind(targetPath: string) {
 
 async function readFilePreview(
   targetPath: string,
+  workspaceId?: string | null,
 ): Promise<FilePreviewPayload> {
-  const absolutePath = path.resolve(targetPath);
+  const { absolutePath } = await resolveWorkspaceScopedExplorerPath(
+    targetPath,
+    workspaceId,
+  );
   const stat = await fs.stat(absolutePath);
 
   if (stat.isDirectory()) {
@@ -10679,20 +10959,232 @@ async function readFilePreview(
 async function writeTextFile(
   targetPath: string,
   content: string,
+  workspaceId?: string | null,
 ): Promise<FilePreviewPayload> {
-  const absolutePath = path.resolve(targetPath);
+  const { absolutePath } = await resolveWorkspaceScopedExplorerPath(
+    targetPath,
+    workspaceId,
+  );
   await fs.writeFile(absolutePath, content, "utf-8");
-  return readFilePreview(absolutePath);
+  return readFilePreview(absolutePath, workspaceId);
+}
+
+function isPathWithinRoot(rootPath: string, targetPath: string): boolean {
+  const relativePath = path.relative(rootPath, targetPath);
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))
+  );
+}
+
+function shouldAutoRenameBookmarkLabel(
+  bookmark: FileBookmarkPayload,
+  previousTargetPath: string,
+): boolean {
+  return (
+    bookmark.label === path.basename(previousTargetPath) ||
+    bookmark.label === previousTargetPath
+  );
+}
+
+function isSameOrDescendantPath(rootPath: string, targetPath: string): boolean {
+  const relativePath = path.relative(rootPath, targetPath);
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !path.isAbsolute(relativePath))
+  );
+}
+
+async function persistUpdatedFileBookmarks(
+  nextBookmarks: FileBookmarkPayload[],
+): Promise<void> {
+  if (nextBookmarks === fileBookmarks) {
+    return;
+  }
+  fileBookmarks = nextBookmarks;
+  emitFileBookmarksState();
+  await persistFileBookmarks();
+}
+
+async function resolveWorkspaceScopedExplorerPath(
+  targetPath?: string | null,
+  workspaceId?: string | null,
+): Promise<{ absolutePath: string; workspaceRoot: string | null }> {
+  const normalizedWorkspaceId =
+    typeof workspaceId === "string" ? workspaceId.trim() : "";
+  const trimmedTargetPath =
+    typeof targetPath === "string" ? targetPath.trim() : "";
+
+  if (!normalizedWorkspaceId) {
+    const fallbackPath = trimmedTargetPath || runtimeSandboxRoot();
+    return {
+      absolutePath: path.resolve(fallbackPath),
+      workspaceRoot: null,
+    };
+  }
+
+  const workspaceRoot = path.resolve(
+    await workspaceDirectoryPath(normalizedWorkspaceId),
+  );
+  const resolvedTargetPath = trimmedTargetPath
+    ? path.resolve(
+        path.isAbsolute(trimmedTargetPath)
+          ? trimmedTargetPath
+          : path.join(workspaceRoot, trimmedTargetPath),
+      )
+    : workspaceRoot;
+
+  if (!isPathWithinRoot(workspaceRoot, resolvedTargetPath)) {
+    throw new Error(`Target path escapes workspace root: ${trimmedTargetPath}`);
+  }
+
+  return {
+    absolutePath: resolvedTargetPath,
+    workspaceRoot,
+  };
+}
+
+async function renameExplorerPath(
+  targetPath: string,
+  nextName: string,
+  workspaceId?: string | null,
+): Promise<FileSystemMutationPayload> {
+  const trimmedName = nextName.trim();
+  if (!trimmedName) {
+    throw new Error("Name cannot be empty.");
+  }
+  if (
+    trimmedName === "." ||
+    trimmedName === ".." ||
+    trimmedName.includes("/") ||
+    trimmedName.includes("\\")
+  ) {
+    throw new Error("Name must not contain path separators.");
+  }
+
+  const { absolutePath, workspaceRoot } = await resolveWorkspaceScopedExplorerPath(
+    targetPath,
+    workspaceId,
+  );
+
+  if (
+    workspaceRoot &&
+    path.normalize(absolutePath) === path.normalize(workspaceRoot)
+  ) {
+    throw new Error("Workspace root cannot be renamed.");
+  }
+
+  const nextAbsolutePath = path.join(path.dirname(absolutePath), trimmedName);
+  if (path.normalize(nextAbsolutePath) === path.normalize(absolutePath)) {
+    return { absolutePath };
+  }
+
+  if (
+    workspaceRoot &&
+    !isPathWithinRoot(workspaceRoot, nextAbsolutePath)
+  ) {
+    throw new Error("Renamed path escapes workspace root.");
+  }
+
+  let targetExists = false;
+  try {
+    await fs.access(nextAbsolutePath);
+    targetExists = true;
+  } catch (cause) {
+    const code = cause && typeof cause === "object" && "code" in cause
+      ? String((cause as { code?: unknown }).code ?? "")
+      : "";
+    if (code !== "ENOENT") {
+      throw cause;
+    }
+  }
+
+  if (targetExists) {
+    throw new Error(`A file or folder named "${trimmedName}" already exists.`);
+  }
+
+  await fs.rename(absolutePath, nextAbsolutePath);
+
+  let didRewriteBookmarks = false;
+  const nextBookmarks = fileBookmarks.map((bookmark) => {
+    if (!isSameOrDescendantPath(absolutePath, bookmark.targetPath)) {
+      return bookmark;
+    }
+
+    const relativePath = path.relative(absolutePath, bookmark.targetPath);
+    const rewrittenTargetPath = relativePath
+      ? path.join(nextAbsolutePath, relativePath)
+      : nextAbsolutePath;
+    const rewrittenLabel =
+      relativePath === "" && shouldAutoRenameBookmarkLabel(bookmark, absolutePath)
+        ? path.basename(nextAbsolutePath)
+        : bookmark.label === bookmark.targetPath
+          ? rewrittenTargetPath
+          : bookmark.label;
+
+    if (
+      rewrittenTargetPath === bookmark.targetPath &&
+      rewrittenLabel === bookmark.label
+    ) {
+      return bookmark;
+    }
+
+    didRewriteBookmarks = true;
+    return {
+      ...bookmark,
+      targetPath: rewrittenTargetPath,
+      label: rewrittenLabel,
+    };
+  });
+
+  if (didRewriteBookmarks) {
+    await persistUpdatedFileBookmarks(nextBookmarks);
+  }
+
+  return {
+    absolutePath: nextAbsolutePath,
+  };
+}
+
+async function deleteExplorerPath(
+  targetPath: string,
+  workspaceId?: string | null,
+): Promise<{ deleted: boolean }> {
+  const { absolutePath, workspaceRoot } = await resolveWorkspaceScopedExplorerPath(
+    targetPath,
+    workspaceId,
+  );
+
+  if (
+    workspaceRoot &&
+    path.normalize(absolutePath) === path.normalize(workspaceRoot)
+  ) {
+    throw new Error("Workspace root cannot be deleted.");
+  }
+
+  const stat = await fs.stat(absolutePath);
+  if (stat.isDirectory()) {
+    await fs.rm(absolutePath, { recursive: true, force: false });
+  } else {
+    await fs.unlink(absolutePath);
+  }
+
+  const nextBookmarks = fileBookmarks.filter(
+    (bookmark) => !isSameOrDescendantPath(absolutePath, bookmark.targetPath),
+  );
+  if (nextBookmarks.length !== fileBookmarks.length) {
+    await persistUpdatedFileBookmarks(nextBookmarks);
+  }
+
+  return { deleted: true };
 }
 
 async function listDirectory(
   targetPath?: string | null,
+  workspaceId?: string | null,
 ): Promise<DirectoryPayload> {
-  const initialPath =
-    targetPath && targetPath.trim().length > 0
-      ? targetPath
-      : runtimeSandboxRoot();
-  const resolvedPath = path.resolve(initialPath);
+  const { absolutePath: resolvedPath, workspaceRoot } =
+    await resolveWorkspaceScopedExplorerPath(targetPath, workspaceId);
   await fs.mkdir(resolvedPath, { recursive: true });
   const stat = await fs.stat(resolvedPath);
 
@@ -10729,9 +11221,10 @@ async function listDirectory(
     return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
   });
 
-  const parsedRoot = path.parse(resolvedPath).root;
   const normalizedCurrent = path.normalize(resolvedPath);
-  const normalizedRoot = path.normalize(parsedRoot);
+  const normalizedRoot = path.normalize(
+    workspaceRoot ? workspaceRoot : path.parse(resolvedPath).root,
+  );
   const parentPath =
     normalizedCurrent === normalizedRoot
       ? null
@@ -11643,6 +12136,195 @@ function handleBrowserWindowOpenAsTab(
   void persistBrowserWorkspace(workspaceId);
 }
 
+function browserContextSuggestedFilename(context: ContextMenuParams): string {
+  const suggested = context.suggestedFilename.trim();
+  if (suggested) {
+    return sanitizeAttachmentName(suggested);
+  }
+
+  const candidateUrl = context.srcURL.trim() || context.linkURL.trim();
+  if (!candidateUrl) {
+    return context.mediaType === "image" ? "image" : "download";
+  }
+
+  try {
+    const parsed = new URL(candidateUrl);
+    const basename = path.basename(parsed.pathname).trim();
+    if (basename) {
+      return sanitizeAttachmentName(basename);
+    }
+  } catch {
+    // fall through to fallback names below
+  }
+
+  return context.mediaType === "image" ? "image" : "download";
+}
+
+function queueBrowserDownloadPrompt(
+  workspaceId: string,
+  targetUrl: string,
+  options: {
+    defaultFilename: string;
+    dialogTitle: string;
+    buttonLabel: string;
+  },
+) {
+  const workspace = browserWorkspaceFromMap(workspaceId);
+  if (!workspace) {
+    return;
+  }
+  workspace.pendingDownloadOverrides.push({
+    url: targetUrl.trim(),
+    defaultPath: path.join(
+      workspaceDirectoryPath(workspaceId),
+      "Downloads",
+      sanitizeAttachmentName(options.defaultFilename),
+    ),
+    dialogTitle: options.dialogTitle,
+    buttonLabel: options.buttonLabel,
+  });
+}
+
+function consumeBrowserDownloadOverride(
+  workspace: BrowserWorkspaceState,
+  targetUrl: string,
+): BrowserDownloadOverride | null {
+  const normalizedTargetUrl = targetUrl.trim();
+  const overrideIndex = workspace.pendingDownloadOverrides.findIndex(
+    (override) => override.url === normalizedTargetUrl,
+  );
+  if (overrideIndex < 0) {
+    return null;
+  }
+  const [override] = workspace.pendingDownloadOverrides.splice(overrideIndex, 1);
+  return override ?? null;
+}
+
+function showBrowserViewContextMenu(params: {
+  workspaceId: string;
+  view: BrowserView;
+  context: ContextMenuParams;
+}) {
+  const { workspaceId, view, context } = params;
+  const template: MenuItemConstructorOptions[] = [];
+  const selectionText = context.selectionText.trim();
+  const linkUrl = context.linkURL.trim();
+  const canGoBack = view.webContents.navigationHistory.canGoBack();
+  const canGoForward = view.webContents.navigationHistory.canGoForward();
+  const popupX = browserBounds.x + context.x;
+  const popupY = browserBounds.y + context.y;
+  const imageUrl = context.srcURL.trim();
+
+  if (linkUrl) {
+    template.push(
+      {
+        label: "Open Link in New Tab",
+        click: () => handleBrowserWindowOpenAsTab(workspaceId, linkUrl, "foreground-tab"),
+      },
+      {
+        label: "Open Link Externally",
+        click: () => {
+          void shell.openExternal(linkUrl);
+        },
+      },
+      {
+        label: "Copy Link Address",
+        click: () => {
+          clipboard.writeText(linkUrl);
+        },
+      },
+      { type: "separator" },
+    );
+  }
+
+  if (context.mediaType === "image" && imageUrl) {
+    template.push(
+      {
+        label: "Open Image in New Tab",
+        click: () =>
+          handleBrowserWindowOpenAsTab(workspaceId, imageUrl, "foreground-tab"),
+      },
+      {
+        label: "Copy Image Address",
+        click: () => {
+          clipboard.writeText(imageUrl);
+        },
+      },
+      {
+        label: "Save Image As...",
+        click: () => {
+          queueBrowserDownloadPrompt(workspaceId, imageUrl, {
+            defaultFilename: browserContextSuggestedFilename(context),
+            dialogTitle: "Save Image As",
+            buttonLabel: "Save Image",
+          });
+          void view.webContents.downloadURL(imageUrl);
+        },
+      },
+      { type: "separator" },
+    );
+  }
+
+  if (context.isEditable) {
+    template.push(
+      { label: "Undo", role: "undo", enabled: context.editFlags.canUndo },
+      { label: "Redo", role: "redo", enabled: context.editFlags.canRedo },
+      { type: "separator" },
+      { label: "Cut", role: "cut", enabled: context.editFlags.canCut },
+      { label: "Copy", role: "copy", enabled: context.editFlags.canCopy },
+      { label: "Paste", role: "paste", enabled: context.editFlags.canPaste },
+      {
+        label: "Select All",
+        role: "selectAll",
+        enabled: context.editFlags.canSelectAll,
+      },
+    );
+  } else if (selectionText) {
+    template.push(
+      { label: "Copy", role: "copy", enabled: context.editFlags.canCopy },
+      {
+        label: "Select All",
+        role: "selectAll",
+        enabled: context.editFlags.canSelectAll,
+      },
+    );
+  } else {
+    template.push(
+      {
+        label: "Back",
+        enabled: canGoBack,
+        click: () => view.webContents.navigationHistory.goBack(),
+      },
+      {
+        label: "Forward",
+        enabled: canGoForward,
+        click: () => view.webContents.navigationHistory.goForward(),
+      },
+      {
+        label: "Reload",
+        click: () => view.webContents.reload(),
+      },
+      {
+        label: "Select All",
+        role: "selectAll",
+        enabled: context.editFlags.canSelectAll,
+      },
+    );
+  }
+
+  if (template.length === 0) {
+    return;
+  }
+
+  Menu.buildFromTemplate(template).popup({
+    window: mainWindow ?? undefined,
+    frame: context.frame ?? undefined,
+    x: popupX,
+    y: popupY,
+    sourceType: context.menuSourceType,
+  });
+}
+
 function createBrowserTab(
   workspaceId: string,
   options: {
@@ -11777,6 +12459,14 @@ function createBrowserTab(
     syncBrowserState(workspaceId, tabId);
   });
 
+  view.webContents.on("context-menu", (_event, params) => {
+    showBrowserViewContextMenu({
+      workspaceId,
+      view,
+      context: params,
+    });
+  });
+
   view.webContents.on(
     "did-fail-load",
     (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
@@ -11837,14 +12527,32 @@ function ensureBrowserWorkspaceDownloadTracking(
 
     const createdAt = new Date().toISOString();
     const downloadId = `download-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const savePath = path.join(app.getPath("downloads"), item.getFilename());
-    item.setSavePath(savePath);
+    const override = consumeBrowserDownloadOverride(
+      currentWorkspace,
+      item.getURL(),
+    );
+    const savePath = override
+      ? ""
+      : resolveWorkspaceDownloadTargetPath(
+          currentWorkspace.workspaceId,
+          item.getFilename(),
+        );
+    if (override) {
+      item.setSaveDialogOptions({
+        title: override.dialogTitle,
+        buttonLabel: override.buttonLabel,
+        defaultPath: override.defaultPath,
+        properties: ["showOverwriteConfirmation"],
+      });
+    } else {
+      item.setSavePath(savePath);
+    }
 
     const payload: BrowserDownloadPayload = {
       id: downloadId,
       url: item.getURL(),
       filename: item.getFilename(),
-      targetPath: savePath,
+      targetPath: item.getSavePath() || savePath,
       status: "progressing",
       receivedBytes: 0,
       totalBytes: item.getTotalBytes(),
@@ -11874,6 +12582,7 @@ function ensureBrowserWorkspaceDownloadTracking(
     item.on("updated", (_updatedEvent, state) => {
       updateDownload({
         status: state === "interrupted" ? "interrupted" : "progressing",
+        targetPath: item.getSavePath() || "",
         receivedBytes: item.getReceivedBytes(),
         totalBytes: item.getTotalBytes(),
       });
@@ -11888,6 +12597,7 @@ function ensureBrowserWorkspaceDownloadTracking(
             : "interrupted";
       updateDownload({
         status: nextStatus,
+        targetPath: item.getSavePath() || "",
         receivedBytes: item.getReceivedBytes(),
         totalBytes: item.getTotalBytes(),
         completedAt:
@@ -13309,18 +14019,40 @@ app.whenReady().then(async () => {
   handleTrustedIpc(
     "fs:listDirectory",
     ["main"],
-    async (_event, targetPath?: string | null) => listDirectory(targetPath),
+    async (_event, targetPath?: string | null, workspaceId?: string | null) =>
+      listDirectory(targetPath, workspaceId),
   );
   handleTrustedIpc(
     "fs:readFilePreview",
     ["main"],
-    async (_event, targetPath: string) => readFilePreview(targetPath),
+    async (_event, targetPath: string, workspaceId?: string | null) =>
+      readFilePreview(targetPath, workspaceId),
   );
   handleTrustedIpc(
     "fs:writeTextFile",
     ["main"],
-    async (_event, targetPath: string, content: string) =>
-      writeTextFile(targetPath, content),
+    async (
+      _event,
+      targetPath: string,
+      content: string,
+      workspaceId?: string | null,
+    ) => writeTextFile(targetPath, content, workspaceId),
+  );
+  handleTrustedIpc(
+    "fs:renamePath",
+    ["main"],
+    async (
+      _event,
+      targetPath: string,
+      nextName: string,
+      workspaceId?: string | null,
+    ) => renameExplorerPath(targetPath, nextName, workspaceId),
+  );
+  handleTrustedIpc(
+    "fs:deletePath",
+    ["main"],
+    async (_event, targetPath: string, workspaceId?: string | null) =>
+      deleteExplorerPath(targetPath, workspaceId),
   );
   handleTrustedIpc("fs:getBookmarks", ["main"], () => fileBookmarks);
   handleTrustedIpc(
@@ -13805,6 +14537,23 @@ app.whenReady().then(async () => {
     "workspace:getProactiveTaskProposalPreference",
     ["main"],
     async () => getProactiveTaskProposalPreference(),
+  );
+  handleTrustedIpc(
+    "workspace:getProactiveHeartbeatConfig",
+    ["main"],
+    async () => getProactiveHeartbeatConfig(),
+  );
+  handleTrustedIpc(
+    "workspace:setProactiveHeartbeatConfig",
+    ["main"],
+    async (_event, payload: ProactiveHeartbeatConfigUpdatePayload) =>
+      setProactiveHeartbeatConfig(payload),
+  );
+  handleTrustedIpc(
+    "workspace:setProactiveHeartbeatWorkspaceEnabled",
+    ["main"],
+    async (_event, payload: ProactiveHeartbeatWorkspaceUpdatePayload) =>
+      setProactiveHeartbeatWorkspaceEnabled(payload),
   );
   handleTrustedIpc(
     "workspace:listRuntimeStates",
