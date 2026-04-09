@@ -383,3 +383,75 @@ test("chat pane can jump to a requested sub-session run", async () => {
     /const requestedOpenSessionId =[\s\S]*sessionOpenRequest\?\.sessionId \|\| ""[\s\S]*\.trim\(\);[\s\S]*const nextSessionId =[\s\S]*hasSessionJumpRequest && requestedSessionId[\s\S]*\? requestedSessionId[\s\S]*: requestedOpenSessionId\)[\s\S]*preferredSessionId\(selectedWorkspaceRef\.current, runtimeStates\.items\);/,
   );
 });
+
+test("chat pane restores the current todo plan from session output events and keeps it live from tool calls", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(
+    source,
+    /const \[currentTodoPlan, setCurrentTodoPlan\] = useState<ChatTodoPlan \| null>\(\s*null,\s*\);/,
+  );
+  assert.match(
+    source,
+    /function todoPlanFromOutputEvents\(outputEvents: SessionOutputEventPayload\[\]\)/,
+  );
+  assert.match(
+    source,
+    /setCurrentTodoPlan\(todoPlanFromOutputEvents\(outputEventHistory\.items\)\);/,
+  );
+  assert.match(
+    source,
+    /const nextTodoPlan = todoPlanFromToolPayload\(eventPayload\);[\s\S]*if \(nextTodoPlan !== undefined\) \{\s*setCurrentTodoPlan\(nextTodoPlan\);\s*\}/,
+  );
+  assert.match(source, /case "blocked":\s*return "Blocked";/);
+  assert.match(
+    source,
+    /case "blocked":\s*return "border-amber-400\/35 bg-amber-400\/12 text-amber-700";/,
+  );
+  assert.match(source, /clearSessionView\(\) \{[\s\S]*setCurrentTodoPlan\(null\);/);
+});
+
+test("chat composer exposes a pause action for in-flight runs and calls the runtime pause API", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(source, /const \[isPausePending, setIsPausePending\] = useState\(false\);/);
+  assert.match(source, /async function pauseCurrentRun\(\)/);
+  assert.match(
+    source,
+    /window\.electronAPI\.workspace\.pauseSessionRun\(\{\s*workspace_id: selectedWorkspaceId,\s*session_id: sessionId,\s*\}\)/,
+  );
+  assert.match(
+    source,
+    /<Composer[\s\S]*pausePending=\{isPausePending\}[\s\S]*pauseDisabled=\{\s*pendingInputIdRef\.current === STREAM_ATTACH_PENDING\s*\}[\s\S]*onPause=\{pauseCurrentRun\}/,
+  );
+  assert.match(
+    source,
+    /isResponding \? \(\s*<Button[\s\S]*onClick=\{onPause\}[\s\S]*>\s*\{pausePending \? \(\s*<Loader2[\s\S]*\) : \(\s*<Square[\s\S]*\)\}\s*Pause\s*<\/Button>\s*\) : \(\s*<Button[\s\S]*<ArrowUp/,
+  );
+  assert.match(source, /disabled=\{pausePending \|\| pauseDisabled\}/);
+});
+
+test("chat pane renders a collapsed current todo panel above the composer", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(source, /function CurrentTodoPanel\(/);
+  assert.match(source, /<span>Current working todo<\/span>/);
+  assert.match(
+    source,
+    /<div className="space-y-3">[\s\S]*\{currentTodoPlan \? \(\s*<CurrentTodoPanel[\s\S]*todoPlan=\{currentTodoPlan\}[\s\S]*expanded=\{todoPanelExpanded\}[\s\S]*onToggle=\{\(\) =>[\s\S]*setTodoPanelExpanded\(\(value\) => !value\)[\s\S]*\}\s*\/>\s*\) : null\}[\s\S]*<Composer/,
+  );
+  assert.match(source, /aria-expanded=\{expanded\}/);
+  assert.match(
+    source,
+    /className=\{`mt-0\.5 shrink-0 text-muted-foreground transition \$\{expanded \? "rotate-0" : "-rotate-90"\}`\}/,
+  );
+  assert.match(source, /All tracked todo items are complete\./);
+  assert.match(
+    source,
+    /task\.status === "pending" \|\|\s*task\.status === "in_progress" \|\|\s*task\.status === "blocked"/,
+  );
+  assert.match(
+    source,
+    /completedStatus === "paused" \|\| completedStatus === "waiting_user"/,
+  );
+});

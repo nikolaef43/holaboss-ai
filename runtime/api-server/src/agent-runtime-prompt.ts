@@ -190,6 +190,14 @@ function recentRuntimeContextPromptSection(context: AgentRecentRuntimeContext | 
   if (context.waiting_for_user === true) {
     lines.push("The previous run paused waiting for user input. Do not treat that state as completed work.");
   }
+  if (stopReason === "paused") {
+    lines.push("The previous run was paused before completion. Do not treat that work as finished.");
+  }
+  if (context.waiting_for_user === true || stopReason === "paused") {
+    lines.push(
+      "If the user's latest message clearly redirects to a new unrelated task, handle that new request first, keep the unfinished prior work marked unfinished, and then propose continuing it after the new task is done."
+    );
+  }
   if (lastError) {
     lines.push(`Previous runtime error: ${lastError}.`);
   }
@@ -432,16 +440,31 @@ export function buildBaseAgentPromptSections(
     "Block path traversal and cross-workspace access by default, including parent-directory paths, absolute external paths, and symlink escapes.",
     "Only cross the workspace boundary when the user explicitly insists, and then keep scope minimal and clearly tied to that instruction.",
     "Keep plans and missing decisions explicit: use coordination capabilities such as question, todo, and skill access instead of relying on hidden state.",
+    "If you create or resume a todo, treat it as the active execution contract: continue working through its unfinished items until the todo is complete or a real blocker requires user or external input.",
+    "Do not stop merely to provide an intermediate progress update or ask whether to continue while executable todo items remain.",
     "If a task requires the user's name or other personal identity details and current user context does not provide them, ask the user explicitly instead of guessing.",
     "On the first strong signal that user input describes a reusable workflow, procedure, or operating pattern, proactively create or update a workspace-local skill instead of waiting for an explicit skill request.",
     "Do not create skills for transient runtime state, one-off task details, or information that only belongs in session continuity.",
     "Tool and verification guidance:",
     "YOU MUST Use available tools, skills, and connected MCP tools whenever they can inspect, verify, retrieve, or complete the task more reliably than reasoning alone.",
     "Prefer direct tool results over assumptions, especially for code, files, workspace state, app state, or live integrations.",
+    "Treat user-specified requirements such as exact fields, counts, rankings, filters, timestamps, and verification targets as completion criteria, not optional detail.",
+    "Before answering, compare the evidence you gathered against the user's requested fields, constraints, thresholds, rankings, timestamps, and verification targets.",
+    "Do not present partial evidence as task completion.",
+    "If the first retrieval path only gives partial evidence, do not stop there: proactively switch to a more direct capability path until the required facts are verified or you can clearly explain what remains unavailable.",
+    "If a more direct capability is unavailable or blocked, explicitly name which required facts or constraints remain unverified.",
     "If the task mentions a concrete file, command, test, resource, API, or integration, check it with the relevant tool before answering.",
     "If you say that you checked, changed, ran, fetched, or verified something, use the relevant tool first and base the answer on the result.",
     "Respond without tool calls only when the request is purely conversational or explanatory and tool use would not improve correctness or completeness."
   ];
+  if (capabilityManifest?.browser_tools.length) {
+    executionLines.push(
+      "When browser capabilities are available, use them as the direct verification path for site-specific or UI-dependent requirements that search or summary tools cannot fully prove.",
+      "Within browser workflows, prefer DOM and structured page state for actions and routine extraction.",
+      "Use browser_get_state with include_screenshot=true, or browser_screenshot, only when visual appearance, layout, prominence, overlays, canvas/chart/PDF content, or user-visible confirmation matters, or when DOM signals remain ambiguous or unreliable.",
+      "Even in screenshot-assisted browser work, keep using DOM-grounded browser actions for clicking, typing, scrolling, and stable extraction whenever possible."
+    );
+  }
   if (request.workspaceSkillIds.length > 0) {
     executionLines.push("When skills are available and relevant, consult them instead of improvising from scratch.");
   }

@@ -181,3 +181,12 @@ test("file explorer exposes right-click rename and delete actions for entries", 
   assert.match(source, /Rename…/);
   assert.match(source, /Delete…/);
 });
+
+test("file explorer does not expose a pane-level close action", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(source, /interface FileExplorerPaneProps \{\s*focusRequest\?: FileExplorerFocusRequest \| null;\s*onFocusRequestConsumed\?: \(requestKey: number\) => void;\s*\}/);
+  assert.match(source, /export function FileExplorerPane\(\{\s*focusRequest = null,\s*onFocusRequestConsumed,\s*}: FileExplorerPaneProps\)/);
+  assert.doesNotMatch(source, /label="Close file explorer"/);
+  assert.doesNotMatch(source, /icon=\{<X size=\{1[23]\} \/>/);
+});

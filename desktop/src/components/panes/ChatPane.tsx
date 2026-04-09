@@ -26,6 +26,7 @@ import {
   Paperclip,
   PencilLine,
   Search,
+  Square,
   Waypoints,
   X,
 } from "lucide-react";
@@ -76,6 +77,33 @@ interface ChatTraceStep {
   status: ChatTraceStepStatus;
   details: string[];
   order: number;
+}
+
+type ChatTodoStatus =
+  | "pending"
+  | "in_progress"
+  | "blocked"
+  | "completed"
+  | "abandoned";
+
+interface ChatTodoTask {
+  id: string;
+  content: string;
+  status: ChatTodoStatus;
+  notes?: string;
+  details?: string;
+}
+
+interface ChatTodoPhase {
+  id: string;
+  name: string;
+  tasks: ChatTodoTask[];
+}
+
+interface ChatTodoPlan {
+  sessionId: string;
+  updatedAt: string | null;
+  phases: ChatTodoPhase[];
 }
 
 interface PendingLocalAttachmentFile {
@@ -631,6 +659,216 @@ function summarizeUnknown(value: unknown, maxLength = 140): string {
   return String(value);
 }
 
+function normalizeChatTodoStatus(value: unknown): ChatTodoStatus | null {
+  const normalized =
+    typeof value === "string"
+      ? value.trim().toLowerCase().replace(/[\s-]+/g, "_")
+      : "";
+  switch (normalized) {
+    case "pending":
+    case "in_progress":
+    case "blocked":
+    case "completed":
+    case "abandoned":
+      return normalized;
+    default:
+      return null;
+  }
+}
+
+function normalizeChatTodoTask(value: unknown): ChatTodoTask | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  const content = typeof value.content === "string" ? value.content.trim() : "";
+  const status = normalizeChatTodoStatus(value.status);
+  if (!id || !content || !status) {
+    return null;
+  }
+  const notes = typeof value.notes === "string" ? value.notes.trim() : "";
+  const details =
+    typeof value.details === "string" ? value.details.trim() : "";
+  return {
+    id,
+    content,
+    status,
+    ...(notes ? { notes } : {}),
+    ...(details ? { details } : {}),
+  };
+}
+
+function normalizeChatTodoPhase(value: unknown): ChatTodoPhase | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  const tasks = Array.isArray(value.tasks)
+    ? value.tasks
+        .map((task) => normalizeChatTodoTask(task))
+        .filter((task): task is ChatTodoTask => Boolean(task))
+    : [];
+  if (!id || !name) {
+    return null;
+  }
+  return { id, name, tasks };
+}
+
+function todoTaskCount(phases: ChatTodoPhase[]) {
+  return phases.reduce((total, phase) => total + phase.tasks.length, 0);
+}
+
+function todoRemainingTaskCount(phases: ChatTodoPhase[]) {
+  return phases.reduce(
+    (total, phase) =>
+      total +
+      phase.tasks.filter(
+        (task) =>
+          task.status === "pending" ||
+          task.status === "in_progress" ||
+          task.status === "blocked",
+      ).length,
+    0,
+  );
+}
+
+function todoCompletedTaskCount(phases: ChatTodoPhase[]) {
+  return phases.reduce(
+    (total, phase) =>
+      total +
+      phase.tasks.filter(
+        (task) =>
+          task.status === "completed" || task.status === "abandoned",
+      ).length,
+    0,
+  );
+}
+
+function currentTodoEntry(phases: ChatTodoPhase[]) {
+  for (const phase of phases) {
+    const inProgressTask = phase.tasks.find(
+      (task) => task.status === "in_progress",
+    );
+    if (inProgressTask) {
+      return { phase, task: inProgressTask };
+    }
+  }
+  for (const phase of phases) {
+    const blockedTask = phase.tasks.find((task) => task.status === "blocked");
+    if (blockedTask) {
+      return { phase, task: blockedTask };
+    }
+  }
+  for (const phase of phases) {
+    const pendingTask = phase.tasks.find((task) => task.status === "pending");
+    if (pendingTask) {
+      return { phase, task: pendingTask };
+    }
+  }
+  return null;
+}
+
+function todoPlanFromToolResult(
+  result: unknown,
+): ChatTodoPlan | null | undefined {
+  if (!isRecord(result)) {
+    return undefined;
+  }
+  const details = isRecord(result.details) ? result.details : null;
+  if (!details || !Array.isArray(details.phases)) {
+    return undefined;
+  }
+
+  const sessionId =
+    typeof details.session_id === "string" ? details.session_id.trim() : "";
+  const updatedAt =
+    typeof details.updated_at === "string" && details.updated_at.trim()
+      ? details.updated_at.trim()
+      : null;
+  const phases = details.phases
+    .map((phase) => normalizeChatTodoPhase(phase))
+    .filter((phase): phase is ChatTodoPhase => Boolean(phase));
+
+  return todoTaskCount(phases) > 0
+    ? {
+        sessionId,
+        updatedAt,
+        phases,
+      }
+    : null;
+}
+
+function todoPlanFromToolPayload(
+  payload: Record<string, unknown>,
+): ChatTodoPlan | null | undefined {
+  const toolName =
+    typeof payload.tool_name === "string"
+      ? payload.tool_name.trim().toLowerCase()
+      : "";
+  const phase =
+    typeof payload.phase === "string" ? payload.phase.trim().toLowerCase() : "";
+  if (
+    (toolName !== "todoread" && toolName !== "todowrite") ||
+    phase !== "completed" ||
+    payload.error === true
+  ) {
+    return undefined;
+  }
+  return todoPlanFromToolResult(payload.result);
+}
+
+function todoPlanFromOutputEvents(outputEvents: SessionOutputEventPayload[]) {
+  const orderedEvents = [...outputEvents].sort(
+    (left, right) =>
+      Date.parse(left.created_at || "") - Date.parse(right.created_at || "") ||
+      left.id - right.id,
+  );
+  let latestTodoPlan: ChatTodoPlan | null = null;
+
+  for (const event of orderedEvents) {
+    if (event.event_type !== "tool_call" || !isRecord(event.payload)) {
+      continue;
+    }
+    const nextTodoPlan = todoPlanFromToolPayload(event.payload);
+    if (nextTodoPlan !== undefined) {
+      latestTodoPlan = nextTodoPlan;
+    }
+  }
+
+  return latestTodoPlan;
+}
+
+function todoStatusLabel(status: ChatTodoStatus) {
+  switch (status) {
+    case "in_progress":
+      return "In progress";
+    case "blocked":
+      return "Blocked";
+    case "completed":
+      return "Completed";
+    case "abandoned":
+      return "Abandoned";
+    default:
+      return "Pending";
+  }
+}
+
+function todoStatusTone(status: ChatTodoStatus) {
+  switch (status) {
+    case "in_progress":
+      return "border-primary/25 bg-primary/10 text-primary";
+    case "blocked":
+      return "border-amber-400/35 bg-amber-400/12 text-amber-700";
+    case "completed":
+      return "border-emerald-500/18 bg-emerald-500/10 text-emerald-600";
+    case "abandoned":
+      return "border-border/40 bg-muted text-muted-foreground";
+    default:
+      return "border-border/45 bg-background text-muted-foreground";
+  }
+}
+
 function runFailedContextLabel(payload: Record<string, unknown>): string {
   const provider =
     typeof payload.provider === "string" ? payload.provider.trim() : "";
@@ -1036,6 +1274,33 @@ function phaseTraceStepFromEvent(
     };
   }
 
+  if (eventType === "run_completed") {
+    const status =
+      typeof payload.status === "string"
+        ? payload.status.trim().toLowerCase()
+        : "";
+    if (status === "waiting_user") {
+      return {
+        id: "phase:awaiting-user",
+        kind: "phase",
+        title: "Waiting for your input",
+        status: "waiting",
+        details: ["The agent needs a follow-up answer before it can continue."],
+        order,
+      };
+    }
+    if (status === "paused") {
+      return {
+        id: "phase:user-paused",
+        kind: "phase",
+        title: "Run paused",
+        status: "waiting",
+        details: ["The run was paused before completion and can be continued in a later turn."],
+        order,
+      };
+    }
+  }
+
   if (eventType === "run_failed") {
     const errorText = runFailedDetail(payload);
     if (errorText) {
@@ -1076,7 +1341,7 @@ function upsertTraceStep(previous: ChatTraceStep[], step: ChatTraceStep) {
 
 function finalizeTraceSteps(
   previous: ChatTraceStep[],
-  status: Extract<ChatTraceStepStatus, "completed" | "error">,
+  status: Extract<ChatTraceStepStatus, "completed" | "error" | "waiting">,
 ) {
   return previous.map((step) =>
     step.status === "running"
@@ -1127,7 +1392,16 @@ function assistantHistoryStateFromOutputEvents(
     }
 
     if (event.event_type === "run_completed") {
-      traceSteps = finalizeTraceSteps(traceSteps, "completed");
+      const completedStatus =
+        typeof eventPayload.status === "string"
+          ? eventPayload.status.trim().toLowerCase()
+          : "";
+      traceSteps = finalizeTraceSteps(
+        traceSteps,
+        completedStatus === "paused" || completedStatus === "waiting_user"
+          ? "waiting"
+          : "completed",
+      );
     } else if (event.event_type === "run_failed") {
       traceSteps = finalizeTraceSteps(traceSteps, "error");
     }
@@ -1218,6 +1492,7 @@ export function ChatPane({
   >([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isResponding, setIsResponding] = useState(false);
+  const [isPausePending, setIsPausePending] = useState(false);
   const [chatErrorMessage, setChatErrorMessage] = useState("");
   const [verboseTelemetryEnabled, setVerboseTelemetryEnabled] = useState(false);
   const [composerBlockHeight, setComposerBlockHeight] = useState(0);
@@ -1239,6 +1514,10 @@ export function ChatPane({
     proposalId: string;
     action: "accept" | "dismiss";
   } | null>(null);
+  const [currentTodoPlan, setCurrentTodoPlan] = useState<ChatTodoPlan | null>(
+    null,
+  );
+  const [todoPanelExpanded, setTodoPanelExpanded] = useState(false);
   const [editingMemoryProposalId, setEditingMemoryProposalId] = useState<
     string | null
   >(null);
@@ -1328,6 +1607,7 @@ export function ChatPane({
   function clearSessionView() {
     setMessages([]);
     setSessionOutputs([]);
+    setCurrentTodoPlan(null);
     setArtifactBrowserOpen(false);
     setArtifactBrowserFilter("all");
     setMemoryProposalAction(null);
@@ -1495,6 +1775,7 @@ export function ChatPane({
       memoryProposalList.proposals,
     );
     setSessionOutputs(nextOutputs);
+    setCurrentTodoPlan(todoPlanFromOutputEvents(outputEventHistory.items));
     setMessages(nextMessages);
     resetLiveTurn();
 
@@ -1821,7 +2102,7 @@ export function ChatPane({
   }
 
   function finalizeLiveTraceSteps(
-    status: Extract<ChatTraceStepStatus, "completed" | "error">,
+    status: Extract<ChatTraceStepStatus, "completed" | "error" | "waiting">,
   ) {
     const next = finalizeTraceSteps(liveTraceStepsRef.current, status);
     setLiveTraceStepsState(next);
@@ -1848,6 +2129,12 @@ export function ChatPane({
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
   }, [selectedWorkspace]);
+
+  useEffect(() => {
+    if (!isResponding) {
+      setIsPausePending(false);
+    }
+  }, [isResponding]);
 
   useEffect(() => {
     setPendingAttachments([]);
@@ -2090,6 +2377,10 @@ export function ChatPane({
     sessionOpenRequest?.requestKey,
     sessionOpenRequest?.sessionId,
   ]);
+
+  useEffect(() => {
+    setTodoPanelExpanded(false);
+  }, [activeSessionId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2415,6 +2706,11 @@ export function ChatPane({
           upsertLiveTraceStep(toolStep);
         }
 
+        const nextTodoPlan = todoPlanFromToolPayload(eventPayload);
+        if (nextTodoPlan !== undefined) {
+          setCurrentTodoPlan(nextTodoPlan);
+        }
+
         if (eventType === "output_delta") {
           const delta =
             typeof eventPayload.delta === "string" ? eventPayload.delta : "";
@@ -2511,7 +2807,13 @@ export function ChatPane({
         }
 
         if (eventType === "run_completed") {
-          finalizeLiveTraceSteps("completed");
+          const completedStatus =
+            typeof eventPayload.status === "string"
+              ? eventPayload.status.trim().toLowerCase()
+              : "";
+          finalizeLiveTraceSteps(
+            completedStatus === "paused" ? "waiting" : "completed",
+          );
           commitLiveAssistantMessage();
           setIsResponding(false);
           activeStreamIdRef.current = null;
@@ -2854,6 +3156,29 @@ export function ChatPane({
         action: "send_failed",
         detail: normalizeErrorMessage(error),
       });
+    }
+  }
+
+  async function pauseCurrentRun() {
+    const sessionId = activeSessionIdRef.current || activeSessionId;
+    if (!selectedWorkspaceId || !sessionId || isPausePending) {
+      return;
+    }
+
+    const previousStatus = liveAgentStatus;
+    setChatErrorMessage("");
+    setLiveAgentStatus("Pausing");
+    setIsPausePending(true);
+
+    try {
+      await window.electronAPI.workspace.pauseSessionRun({
+        workspace_id: selectedWorkspaceId,
+        session_id: sessionId,
+      });
+    } catch (error) {
+      setIsPausePending(false);
+      setLiveAgentStatus(previousStatus || "Working");
+      setChatErrorMessage(normalizeErrorMessage(error));
     }
   }
 
@@ -3558,44 +3883,62 @@ export function ChatPane({
                     </div>
                   </div>
                   <form onSubmit={onSubmit} className="w-full">
-                    <Composer
-                      input={input}
-                      attachments={pendingAttachmentItems}
-                      isResponding={isResponding}
-                      disabled={composerDisabled}
-                      disabledReason={composerDisabledReason}
-                      selectedModel={effectiveChatModelPreference}
-                      resolvedModelLabel={
-                        resolvedChatModel || modelSelectionUnavailableReason
-                      }
-                      runtimeDefaultModelLabel={runtimeDefaultModel}
-                      modelOptions={availableChatModelOptions}
-                      modelOptionGroups={availableChatModelOptionGroups}
-                      runtimeDefaultModelAvailable={
-                        runtimeDefaultModelAvailable
-                      }
-                      modelSelectionUnavailableReason={
-                        modelSelectionUnavailableReason
-                      }
-                      placeholder={textareaPlaceholder}
-                      showModelSelector={!isOnboardingVariant}
-                      onModelChange={setChatModelPreference}
-                      onOpenModelProviders={() =>
-                        void window.electronAPI.ui.openSettingsPane("providers")
-                      }
-                      textareaRef={textareaRef}
-                      fileInputRef={fileInputRef}
-                      onChange={setInput}
-                      onKeyDown={onComposerKeyDown}
-                      onCompositionStart={onComposerCompositionStart}
-                      onCompositionEnd={onComposerCompositionEnd}
-                      onAttachmentInputChange={onAttachmentInputChange}
-                      onAddDroppedFiles={appendPendingLocalFiles}
-                      onAddExplorerAttachments={
-                        appendPendingExplorerAttachments
-                      }
-                      onRemoveAttachment={removePendingAttachment}
-                    />
+                    <div className="space-y-3">
+                      {currentTodoPlan ? (
+                        <CurrentTodoPanel
+                          todoPlan={currentTodoPlan}
+                          expanded={todoPanelExpanded}
+                          onToggle={() =>
+                            setTodoPanelExpanded((value) => !value)
+                          }
+                        />
+                      ) : null}
+                      <Composer
+                        input={input}
+                        attachments={pendingAttachmentItems}
+                        isResponding={isResponding}
+                        pausePending={isPausePending}
+                        pauseDisabled={
+                          pendingInputIdRef.current === STREAM_ATTACH_PENDING
+                        }
+                        disabled={composerDisabled}
+                        disabledReason={composerDisabledReason}
+                        selectedModel={effectiveChatModelPreference}
+                        resolvedModelLabel={
+                          resolvedChatModel || modelSelectionUnavailableReason
+                        }
+                        runtimeDefaultModelLabel={runtimeDefaultModel}
+                        modelOptions={availableChatModelOptions}
+                        modelOptionGroups={availableChatModelOptionGroups}
+                        runtimeDefaultModelAvailable={
+                          runtimeDefaultModelAvailable
+                        }
+                        modelSelectionUnavailableReason={
+                          modelSelectionUnavailableReason
+                        }
+                        placeholder={textareaPlaceholder}
+                        showModelSelector={!isOnboardingVariant}
+                        onModelChange={setChatModelPreference}
+                        onOpenModelProviders={() =>
+                          void window.electronAPI.ui.openSettingsPane(
+                            "providers",
+                          )
+                        }
+                        textareaRef={textareaRef}
+                        fileInputRef={fileInputRef}
+                        onChange={setInput}
+                        onKeyDown={onComposerKeyDown}
+                        onCompositionStart={onComposerCompositionStart}
+                        onCompositionEnd={onComposerCompositionEnd}
+                        onAttachmentInputChange={onAttachmentInputChange}
+                        onPause={pauseCurrentRun}
+                        onAddDroppedFiles={appendPendingLocalFiles}
+                        onAddExplorerAttachments={
+                          appendPendingExplorerAttachments
+                        }
+                        onRemoveAttachment={removePendingAttachment}
+                      />
+                    </div>
                   </form>
                 </div>
               )}
@@ -3619,40 +3962,56 @@ export function ChatPane({
           {hasMessages ? (
             <div ref={composerBlockRef} className="shrink-0 px-6 pb-5 pt-3">
               <form onSubmit={onSubmit} className="w-full">
-                <Composer
-                  input={input}
-                  attachments={pendingAttachmentItems}
-                  isResponding={isResponding}
-                  disabled={composerDisabled}
-                  disabledReason={composerDisabledReason}
-                  selectedModel={effectiveChatModelPreference}
-                  resolvedModelLabel={
-                    resolvedChatModel || modelSelectionUnavailableReason
-                  }
-                  runtimeDefaultModelLabel={runtimeDefaultModel}
-                  modelOptions={availableChatModelOptions}
-                  modelOptionGroups={availableChatModelOptionGroups}
-                  runtimeDefaultModelAvailable={runtimeDefaultModelAvailable}
-                  modelSelectionUnavailableReason={
-                    modelSelectionUnavailableReason
-                  }
-                  placeholder={textareaPlaceholder}
-                  showModelSelector={!isOnboardingVariant}
-                  onModelChange={setChatModelPreference}
-                  onOpenModelProviders={() =>
-                    void window.electronAPI.ui.openSettingsPane("providers")
-                  }
-                  textareaRef={textareaRef}
-                  fileInputRef={fileInputRef}
-                  onChange={setInput}
-                  onKeyDown={onComposerKeyDown}
-                  onCompositionStart={onComposerCompositionStart}
-                  onCompositionEnd={onComposerCompositionEnd}
-                  onAttachmentInputChange={onAttachmentInputChange}
-                  onAddDroppedFiles={appendPendingLocalFiles}
-                  onAddExplorerAttachments={appendPendingExplorerAttachments}
-                  onRemoveAttachment={removePendingAttachment}
-                />
+                <div className="space-y-3">
+                  {currentTodoPlan ? (
+                    <CurrentTodoPanel
+                      todoPlan={currentTodoPlan}
+                      expanded={todoPanelExpanded}
+                      onToggle={() =>
+                        setTodoPanelExpanded((value) => !value)
+                      }
+                    />
+                  ) : null}
+                  <Composer
+                    input={input}
+                    attachments={pendingAttachmentItems}
+                    isResponding={isResponding}
+                    pausePending={isPausePending}
+                    pauseDisabled={
+                      pendingInputIdRef.current === STREAM_ATTACH_PENDING
+                    }
+                    disabled={composerDisabled}
+                    disabledReason={composerDisabledReason}
+                    selectedModel={effectiveChatModelPreference}
+                    resolvedModelLabel={
+                      resolvedChatModel || modelSelectionUnavailableReason
+                    }
+                    runtimeDefaultModelLabel={runtimeDefaultModel}
+                    modelOptions={availableChatModelOptions}
+                    modelOptionGroups={availableChatModelOptionGroups}
+                    runtimeDefaultModelAvailable={runtimeDefaultModelAvailable}
+                    modelSelectionUnavailableReason={
+                      modelSelectionUnavailableReason
+                    }
+                    placeholder={textareaPlaceholder}
+                    showModelSelector={!isOnboardingVariant}
+                    onModelChange={setChatModelPreference}
+                    onOpenModelProviders={() =>
+                      void window.electronAPI.ui.openSettingsPane("providers")
+                    }
+                    textareaRef={textareaRef}
+                    fileInputRef={fileInputRef}
+                    onChange={setInput}
+                    onKeyDown={onComposerKeyDown}
+                    onCompositionStart={onComposerCompositionStart}
+                    onCompositionEnd={onComposerCompositionEnd}
+                    onAttachmentInputChange={onAttachmentInputChange}
+                    onPause={pauseCurrentRun}
+                    onAddDroppedFiles={appendPendingLocalFiles}
+                    onAddExplorerAttachments={appendPendingExplorerAttachments}
+                    onRemoveAttachment={removePendingAttachment}
+                  />
+                </div>
               </form>
             </div>
           ) : null}
@@ -3680,6 +4039,8 @@ interface ComposerProps {
     size_bytes: number;
   }>;
   isResponding: boolean;
+  pausePending: boolean;
+  pauseDisabled: boolean;
   disabled: boolean;
   disabledReason?: string;
   selectedModel: string;
@@ -3700,6 +4061,7 @@ interface ComposerProps {
   onCompositionStart: (event: CompositionEvent<HTMLTextAreaElement>) => void;
   onCompositionEnd: (event: CompositionEvent<HTMLTextAreaElement>) => void;
   onAttachmentInputChange: (event: ChangeEvent<HTMLInputElement>) => void;
+  onPause: () => void;
   onAddDroppedFiles: (files: File[]) => void;
   onAddExplorerAttachments: (files: ExplorerAttachmentDragPayload[]) => void;
   onRemoveAttachment: (attachmentId: string) => void;
@@ -3930,6 +4292,114 @@ function AssistantTurnOutputs({
             View all artifacts ({sessionOutputs.length})
           </span>
         </button>
+      ) : null}
+    </div>
+  );
+}
+
+function CurrentTodoPanel({
+  todoPlan,
+  expanded,
+  onToggle,
+}: {
+  todoPlan: ChatTodoPlan;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const totalTaskCount = todoTaskCount(todoPlan.phases);
+  const remainingTaskCount = todoRemainingTaskCount(todoPlan.phases);
+  const completedTaskCount = todoCompletedTaskCount(todoPlan.phases);
+  const activeEntry = currentTodoEntry(todoPlan.phases);
+
+  return (
+    <div className="overflow-hidden rounded-[20px] border border-border/35 bg-card/78 shadow-sm backdrop-blur-sm">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={expanded}
+        className="flex w-full items-start justify-between gap-3 px-4 py-3 text-left transition hover:bg-muted/30"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+            {remainingTaskCount > 0 ? (
+              <Clock3 size={12} className="shrink-0" />
+            ) : (
+              <Check size={12} className="shrink-0 text-emerald-500" />
+            )}
+            <span>Current working todo</span>
+          </div>
+          <div className="mt-1 truncate text-[13px] font-medium text-foreground">
+            {activeEntry
+              ? activeEntry.task.content
+              : "All tracked todo items are complete."}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+            {activeEntry ? (
+              <span className="truncate">{activeEntry.phase.name}</span>
+            ) : null}
+            <span>
+              {remainingTaskCount} remaining of {totalTaskCount}
+            </span>
+            <span>{completedTaskCount} complete</span>
+          </div>
+        </div>
+        <ChevronDown
+          size={14}
+          className={`mt-0.5 shrink-0 text-muted-foreground transition ${expanded ? "rotate-0" : "-rotate-90"}`}
+        />
+      </button>
+
+      {expanded ? (
+        <div className="border-t border-border/20 px-4 py-3">
+          <div className="space-y-3">
+            {todoPlan.phases.map((phase) => {
+              const phaseCompletedCount = phase.tasks.filter(
+                (task) =>
+                  task.status === "completed" || task.status === "abandoned",
+              ).length;
+              return (
+                <div
+                  key={phase.id}
+                  className="rounded-[16px] border border-border/25 bg-muted/28 px-3 py-3"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-[12px] font-medium text-foreground">
+                      {phase.name}
+                    </div>
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                      {phaseCompletedCount}/{phase.tasks.length} complete
+                    </div>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {phase.tasks.map((task) => {
+                      const isActiveTask = activeEntry?.task.id === task.id;
+                      return (
+                        <div
+                          key={task.id}
+                          className="flex items-start gap-2 text-[12px] leading-5"
+                        >
+                          <span
+                            className={`mt-0.5 inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${todoStatusTone(task.status)}`}
+                          >
+                            {todoStatusLabel(task.status)}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="text-foreground">{task.content}</div>
+                            {isActiveTask && task.details ? (
+                              <div className="mt-1 whitespace-pre-wrap text-[11px] text-muted-foreground">
+                                {task.details}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       ) : null}
     </div>
   );
@@ -4661,6 +5131,8 @@ function Composer({
   input,
   attachments,
   isResponding,
+  pausePending,
+  pauseDisabled,
   disabled,
   disabledReason = "",
   selectedModel,
@@ -4681,6 +5153,7 @@ function Composer({
   onCompositionStart,
   onCompositionEnd,
   onAttachmentInputChange,
+  onPause,
   onAddDroppedFiles,
   onAddExplorerAttachments,
   onRemoveAttachment,
@@ -4874,22 +5347,34 @@ function Composer({
           >
             <Paperclip size={15} />
           </Button>
-          <Button
-            size="icon"
-            disabled={
-              (!input.trim() && attachments.length === 0) ||
-              isResponding ||
-              disabled
-            }
-            render={<button type="submit" />}
-            className="rounded-full"
-          >
-            {isResponding ? (
-              <Loader2 size={16} className="animate-spin" />
-            ) : (
+          {isResponding ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={pausePending || pauseDisabled}
+              onClick={onPause}
+              className="rounded-full px-3"
+            >
+              {pausePending ? (
+                <Loader2 size={14} className="mr-1.5 animate-spin" />
+              ) : (
+                <Square size={12} className="mr-1.5 fill-current" />
+              )}
+              Pause
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              disabled={
+                (!input.trim() && attachments.length === 0) || disabled
+              }
+              render={<button type="submit" />}
+              className="rounded-full"
+            >
               <ArrowUp size={16} />
-            )}
-          </Button>
+            </Button>
+          )}
         </div>
       </div>
     </div>

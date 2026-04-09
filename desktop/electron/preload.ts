@@ -87,9 +87,18 @@ interface BrowserStatePayload {
   error: string;
 }
 
+type BrowserSpaceId = "user" | "agent";
+
+interface BrowserTabCountsPayload {
+  user: number;
+  agent: number;
+}
+
 interface BrowserTabListPayload {
+  space: BrowserSpaceId;
   activeTabId: string;
   tabs: BrowserStatePayload[];
+  tabCounts: BrowserTabCountsPayload;
 }
 
 interface BrowserBookmarkPayload {
@@ -203,6 +212,7 @@ interface AppUpdateStatusPayload {
 interface WorkbenchOpenBrowserPayload {
   workspaceId?: string | null;
   url?: string | null;
+  space?: BrowserSpaceId | null;
 }
 
 interface TemplateAgentInfoPayload {
@@ -579,6 +589,12 @@ interface EnqueueSessionInputResponsePayload {
   status: string;
 }
 
+interface PauseSessionRunResponsePayload {
+  input_id: string;
+  session_id: string;
+  status: string;
+}
+
 interface HolabossClientConfigPayload {
   projectsUrl: string;
   marketplaceUrl: string;
@@ -650,6 +666,11 @@ interface HolabossQueueSessionInputPayload {
   idempotency_key?: string | null;
   priority?: number;
   model?: string | null;
+}
+
+interface HolabossPauseSessionRunPayload {
+  workspace_id: string;
+  session_id: string;
 }
 
 interface HolabossStreamSessionOutputsPayload {
@@ -1082,6 +1103,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("workspace:stageSessionAttachmentPaths", payload) as Promise<StageSessionAttachmentsResponsePayload>,
     queueSessionInput: (payload: HolabossQueueSessionInputPayload) =>
       ipcRenderer.invoke("workspace:queueSessionInput", payload) as Promise<EnqueueSessionInputResponsePayload>,
+    pauseSessionRun: (payload: HolabossPauseSessionRunPayload) =>
+      ipcRenderer.invoke("workspace:pauseSessionRun", payload) as Promise<PauseSessionRunResponsePayload>,
     openSessionOutputStream: (payload: HolabossStreamSessionOutputsPayload) =>
       ipcRenderer.invoke("workspace:openSessionOutputStream", payload) as Promise<HolabossSessionStreamHandlePayload>,
     closeSessionOutputStream: (streamId: string, reason?: string) =>
@@ -1179,8 +1202,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     }
   },
   browser: {
-    setActiveWorkspace: (workspaceId?: string | null) =>
-      ipcRenderer.invoke("browser:setActiveWorkspace", workspaceId) as Promise<BrowserTabListPayload>,
+    setActiveWorkspace: (workspaceId?: string | null, space?: BrowserSpaceId | null) =>
+      ipcRenderer.invoke("browser:setActiveWorkspace", workspaceId, space) as Promise<BrowserTabListPayload>,
     getState: () => ipcRenderer.invoke("browser:getState") as Promise<BrowserTabListPayload>,
     setBounds: (bounds: BrowserBoundsPayload) => ipcRenderer.invoke("browser:setBounds", bounds) as Promise<BrowserTabListPayload>,
     navigate: (targetUrl: string) => ipcRenderer.invoke("browser:navigate", targetUrl) as Promise<BrowserTabListPayload>,

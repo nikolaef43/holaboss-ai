@@ -49,7 +49,8 @@ test("app shell polls runtime notifications and renders the toast stack", async 
   assert.match(source, /<NotificationToastStack[\s\S]*leadingToast=\{/);
   assert.match(source, /<NotificationToastStack[\s\S]*notifications=\{toastNotifications\}/);
   assert.match(source, /<NotificationToastStack[\s\S]*onCloseToast=\{\(notificationId\) => \{\s*void handleDismissNotification\(notificationId\);\s*\}\}/);
-  assert.match(source, /<NotificationToastStack[\s\S]*className=\{anchoredToastStackClassName\}/);
+  assert.doesNotMatch(source, /className=\{anchoredToastStackClassName\}/);
+  assert.doesNotMatch(source, /style=\{anchoredToastStackStyle\}/);
   assert.match(source, /const runtimeNotificationById = useMemo\(/);
 });
 
@@ -104,22 +105,19 @@ test("app shell uses the integrated title bar path for macOS and Windows", async
   );
 });
 
-test("app shell keeps update toasts inside the safe file pane region instead of suspending the browser", async () => {
+test("app shell no longer reserves a separate safe pane region for update toasts", async () => {
   const source = await readFile(APP_SHELL_PATH, "utf8");
 
   assert.match(
     source,
     /const effectiveAppUpdateStatus = useMemo\(/,
   );
-  assert.match(
-    source,
-    /const shouldUseSafeToastAnchor =[\s\S]*!spaceMode \|\| visibleSpacePaneIds\.includes\("files"\)/,
-  );
-  assert.match(source, /const LEFT_NAVIGATION_RAIL_WIDTH_PX = 60;/);
-  assert.match(source, /const APP_SHELL_SPACE_COLUMN_GAP_PX = 8;/);
-  assert.match(source, /const FIXED_SAFE_TOAST_REGION_WIDTH_PX =[\s\S]*MIN_FILES_PANE_WIDTH;/);
-  assert.match(source, /const anchoredToastStackClassName = shouldUseSafeToastAnchor[\s\S]*absolute bottom-4 left-0/);
-  assert.match(source, /const anchoredToastStackStyle = shouldUseSafeToastAnchor[\s\S]*width: FIXED_SAFE_TOAST_REGION_WIDTH_PX/);
+  assert.doesNotMatch(source, /shouldUseSafeToastAnchor/);
+  assert.doesNotMatch(source, /LEFT_NAVIGATION_RAIL_WIDTH_PX/);
+  assert.doesNotMatch(source, /APP_SHELL_SPACE_COLUMN_GAP_PX/);
+  assert.doesNotMatch(source, /FIXED_SAFE_TOAST_REGION_WIDTH_PX/);
+  assert.doesNotMatch(source, /anchoredToastStackClassName/);
+  assert.doesNotMatch(source, /anchoredToastStackStyle/);
   assert.match(
     source,
     /const shouldSuspendBrowserNativeView =\s*isUtilityPaneResizing \|\|[\s\S]*workspaceSwitcherOpen \|\|[\s\S]*settingsDialogOpen \|\|[\s\S]*createWorkspacePanelOpen \|\|[\s\S]*publishOpen;/,
@@ -130,10 +128,17 @@ test("app shell keeps update toasts inside the safe file pane region instead of 
 test("app shell uses a wider minimum for the file explorer than for the browser pane", async () => {
   const source = await readFile(APP_SHELL_PATH, "utf8");
 
-  assert.match(source, /const MIN_FILES_PANE_WIDTH = 320;/);
-  assert.match(source, /const MIN_BROWSER_PANE_WIDTH = 200;/);
+  assert.match(source, /const MIN_FILES_PANE_WIDTH = 220;/);
+  assert.match(source, /const MIN_BROWSER_PANE_WIDTH = 120;/);
+  assert.match(source, /const MIN_AGENT_CONTENT_WIDTH = 380;/);
   assert.match(source, /const DEFAULT_FILES_PANE_WIDTH = MIN_FILES_PANE_WIDTH;/);
   assert.match(source, /function utilityPaneMinWidth\(paneId: UtilityPaneId\): number \{/);
+  assert.match(
+    source,
+    /pane\.flex\s*\?\s*\{\s*minWidth: `\$\{MIN_AGENT_CONTENT_WIDTH\}px`,\s*\}\s*:\s*\{ width: `\$\{pane\.width\}px` \}/,
+  );
+  assert.match(source, /const syncUtilityPaneWidths = useCallback\(\(\) => \{/);
+  assert.match(source, /new ResizeObserver\(\(\) => \{\s*syncUtilityPaneWidths\(\);\s*\}\)/);
 });
 
 test("app shell passes the app version label into the left rail", async () => {
@@ -151,6 +156,42 @@ test("app shell requests remote task proposal generation without a separate succ
   assert.match(source, /Suggestions are unavailable right now\./);
   assert.doesNotMatch(source, /Remote heartbeat accepted/);
   assert.doesNotMatch(source, /Pending cloud jobs/);
+});
+
+test("app shell restores pane visibility and exposes manual files and browser surface controls", async () => {
+  const source = await readFile(APP_SHELL_PATH, "utf8");
+
+  assert.match(source, /function loadSpaceVisibility\(\): SpaceVisibilityState \{/);
+  assert.match(source, /localStorage\.getItem\(SPACE_VISIBILITY_STORAGE_KEY\)/);
+  assert.match(source, /agent: true,/);
+  assert.match(source, /const toggleUtilityPaneVisibility = useCallback\(\(paneId: UtilityPaneId\) => \{/);
+  assert.match(source, /setActiveLeftRailItem\("space"\);/);
+  assert.match(source, /className="mr-1\.5 flex w-9 shrink-0 flex-col items-center gap-1\.5 py-1"/);
+  assert.match(source, /aria-label="Toggle files pane"/);
+  assert.match(source, /title="Files"/);
+  assert.match(source, /aria-pressed=\{spaceVisibility\.files\}/);
+  assert.match(source, /onClick=\{\(\) => toggleUtilityPaneVisibility\("files"\)\}/);
+  assert.match(source, /aria-label="Toggle browser pane"/);
+  assert.match(source, /title="Browser"/);
+  assert.match(source, /aria-pressed=\{spaceVisibility\.browser\}/);
+  assert.match(source, /onClick=\{\(\) => toggleUtilityPaneVisibility\("browser"\)\}/);
+  assert.match(source, /<FileExplorerPane[\s\S]*focusRequest=\{fileExplorerFocusRequest\}/);
+  assert.doesNotMatch(source, /<FileExplorerPane[\s\S]*onClosePane=/);
+  assert.match(source, /<BrowserPane[\s\S]*layoutSyncKey=\{/);
+  assert.doesNotMatch(source, /<BrowserPane[\s\S]*onClosePane=/);
+  assert.match(source, /spaceVisibility\.files[\s\S]*\? "bg-primary\/12 text-primary"[\s\S]*: "text-muted-foreground hover:bg-accent\/36 hover:text-accent-foreground"/);
+  assert.match(source, /spaceVisibility\.browser[\s\S]*\? "bg-primary\/12 text-primary"[\s\S]*: "text-muted-foreground hover:bg-accent\/36 hover:text-accent-foreground"/);
+  assert.doesNotMatch(source, /inline-flex h-8 items-center gap-2 rounded-full border px-3/);
+  assert.doesNotMatch(source, /spaceDrawerToggleLabel/);
+  assert.doesNotMatch(source, /utilityPaneRenderWidth/);
+});
+
+test("app shell routes agent-originated browser opens into the agent browser space", async () => {
+  const source = await readFile(APP_SHELL_PATH, "utf8");
+
+  assert.match(source, /const targetBrowserSpace =\s*payload\.space === "agent" \? "agent" : "user";/);
+  assert.match(source, /\.setActiveWorkspace\(\s*payload\.workspaceId \?\? selectedWorkspaceId \?\? null,\s*targetBrowserSpace,\s*\)/);
+  assert.match(source, /\.setActiveWorkspace\(targetWorkspaceId, "user"\)/);
 });
 
 test("app shell polls proactive status for the selected workspace", async () => {

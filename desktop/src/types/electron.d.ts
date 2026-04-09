@@ -82,9 +82,18 @@ declare global {
     error: string;
   }
 
+  type BrowserSpaceId = "user" | "agent";
+
+  interface BrowserTabCountsPayload {
+    user: number;
+    agent: number;
+  }
+
   interface BrowserTabListPayload {
+    space: BrowserSpaceId;
     activeTabId: string;
     tabs: BrowserStatePayload[];
+    tabCounts: BrowserTabCountsPayload;
   }
 
   interface BrowserBookmarkPayload {
@@ -222,6 +231,7 @@ declare global {
   interface WorkbenchOpenBrowserPayload {
     workspaceId?: string | null;
     url?: string | null;
+    space?: BrowserSpaceId | null;
   }
 
   interface TemplateAgentInfoPayload {
@@ -672,6 +682,12 @@ declare global {
     status: string;
   }
 
+  interface PauseSessionRunResponsePayload {
+    input_id: string;
+    session_id: string;
+    status: string;
+  }
+
   interface HolabossClientConfigPayload {
     projectsUrl: string;
     marketplaceUrl: string;
@@ -859,6 +875,11 @@ declare global {
     inputId?: string | null;
     includeHistory?: boolean;
     stopOnTerminal?: boolean;
+  }
+
+  interface HolabossPauseSessionRunPayload {
+    workspace_id: string;
+    session_id: string;
   }
 
   interface HolabossSessionStreamHandlePayload {
@@ -1189,6 +1210,7 @@ declare global {
         payload: StageSessionAttachmentPathsPayload
       ) => Promise<StageSessionAttachmentsResponsePayload>;
       queueSessionInput: (payload: HolabossQueueSessionInputPayload) => Promise<EnqueueSessionInputResponsePayload>;
+      pauseSessionRun: (payload: HolabossPauseSessionRunPayload) => Promise<PauseSessionRunResponsePayload>;
       openSessionOutputStream: (payload: HolabossStreamSessionOutputsPayload) => Promise<HolabossSessionStreamHandlePayload>;
       closeSessionOutputStream: (streamId: string, reason?: string) => Promise<void>;
       getSessionStreamDebug: () => Promise<HolabossSessionStreamDebugEntry[]>;
@@ -1244,7 +1266,7 @@ declare global {
       onError: (callback: (context: AuthErrorPayload) => unknown) => () => void;
     };
     browser: {
-      setActiveWorkspace: (workspaceId?: string | null) => Promise<BrowserTabListPayload>;
+      setActiveWorkspace: (workspaceId?: string | null, space?: BrowserSpaceId | null) => Promise<BrowserTabListPayload>;
       getState: () => Promise<BrowserTabListPayload>;
       setBounds: (bounds: BrowserBoundsPayload) => Promise<BrowserTabListPayload>;
       navigate: (targetUrl: string) => Promise<BrowserTabListPayload>;

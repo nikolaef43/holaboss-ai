@@ -39,6 +39,8 @@ import {
 import {
     CircleCheck,
     Clock3,
+    FileText,
+    Globe,
     Inbox as InboxIcon,
     Loader2,
     PanelRightClose,
@@ -78,25 +80,19 @@ const THEMES = [
   "bubblegum-dark",
   "bubblegum-light",
 ] as const;
-const MIN_FILES_PANE_WIDTH = 320;
-const MIN_BROWSER_PANE_WIDTH = 200;
+const MIN_FILES_PANE_WIDTH = 220;
+const MIN_BROWSER_PANE_WIDTH = 120;
 const MAX_UTILITY_PANE_WIDTH = 720;
 const LEGACY_DEFAULT_FILES_PANE_WIDTH = 420;
 const DEFAULT_FILES_PANE_WIDTH = MIN_FILES_PANE_WIDTH;
 const DEFAULT_BROWSER_PANE_WIDTH = 460;
-const MIN_AGENT_CONTENT_WIDTH = 120;
+const MIN_AGENT_CONTENT_WIDTH = 380;
 const UTILITY_PANE_RESIZER_WIDTH = 16;
-const LEFT_NAVIGATION_RAIL_WIDTH_PX = 60;
-const APP_SHELL_SPACE_COLUMN_GAP_PX = 8;
 const APP_UPDATE_CHANGELOG_BASE_URL =
   "https://github.com/holaboss-ai/holaboss-ai/releases/tag";
 const DEFAULT_NOTIFICATION_TOAST_DURATION_MS = 7_000;
 const CRITICAL_NOTIFICATION_TOAST_DURATION_MS = 12_000;
 const DEFAULT_PROACTIVE_HEARTBEAT_CRON = "0 9 * * *";
-const FIXED_SAFE_TOAST_REGION_WIDTH_PX =
-  LEFT_NAVIGATION_RAIL_WIDTH_PX +
-  APP_SHELL_SPACE_COLUMN_GAP_PX +
-  MIN_FILES_PANE_WIDTH;
 
 type SpaceComponentId = "agent" | "files" | "browser";
 type UtilityPaneId = "files" | "browser";
@@ -254,6 +250,29 @@ function notificationActivationState(
 }
 
 function loadSpaceVisibility(): SpaceVisibilityState {
+  try {
+    const raw = localStorage.getItem(SPACE_VISIBILITY_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<
+        Record<SpaceComponentId, unknown>
+      >;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return {
+          agent: true,
+          files:
+            typeof parsed.files === "boolean"
+              ? parsed.files
+              : DEFAULT_SPACE_VISIBILITY.files,
+          browser:
+            typeof parsed.browser === "boolean"
+              ? parsed.browser
+              : DEFAULT_SPACE_VISIBILITY.browser,
+        };
+      }
+    }
+  } catch {
+    // ignore invalid persisted layout state
+  }
   return DEFAULT_SPACE_VISIBILITY;
 }
 
@@ -965,6 +984,28 @@ function AppShellContent() {
     [],
   );
 
+  const syncUtilityPaneWidths = useCallback(() => {
+    const visiblePaneIds = FIXED_SPACE_ORDER.filter(
+      (pane) => spaceVisibilityRef.current[pane],
+    );
+    if (visiblePaneIds.length === 0) {
+      return;
+    }
+
+    const flexPaneId = visiblePaneIds.includes("agent")
+      ? "agent"
+      : (visiblePaneIds[visiblePaneIds.length - 1] ?? null);
+
+    if (spaceVisibilityRef.current.files && flexPaneId !== "files") {
+      setFilesPaneWidth((current) => clampUtilityPaneWidth("files", current));
+    }
+    if (spaceVisibilityRef.current.browser && flexPaneId !== "browser") {
+      setBrowserPaneWidth((current) =>
+        clampUtilityPaneWidth("browser", current),
+      );
+    }
+  }, [clampUtilityPaneWidth]);
+
   useEffect(() => {
     if (!window.electronAPI) {
       return;
@@ -1055,6 +1096,8 @@ function AppShellContent() {
             browser: true,
           }));
         };
+        const targetBrowserSpace =
+          payload.space === "agent" ? "agent" : "user";
 
         const requestedUrl =
           typeof payload.url === "string" ? payload.url.trim() : "";
@@ -1063,12 +1106,19 @@ function AppShellContent() {
           void window.electronAPI.browser
             .setActiveWorkspace(
               payload.workspaceId ?? selectedWorkspaceId ?? null,
+              targetBrowserSpace,
             )
             .then(() => window.electronAPI.browser.navigate(requestedUrl))
             .catch(() => undefined);
           return;
         }
         openBrowserPane();
+        void window.electronAPI.browser
+          .setActiveWorkspace(
+            payload.workspaceId ?? selectedWorkspaceId ?? null,
+            targetBrowserSpace,
+          )
+          .catch(() => undefined);
       },
     );
 
@@ -1308,6 +1358,15 @@ function AppShellContent() {
     void window.electronAPI.ui.openExternalUrl(url);
   }, []);
 
+  const toggleUtilityPaneVisibility = useCallback((paneId: UtilityPaneId) => {
+    setActiveLeftRailItem("space");
+    setSpaceVisibility((previous) => ({
+      ...previous,
+      agent: true,
+      [paneId]: !previous[paneId],
+    }));
+  }, []);
+
   const revealBrowserPane = useCallback(() => {
     setActiveLeftRailItem("space");
     setSpaceVisibility((previous) => ({
@@ -1329,7 +1388,7 @@ function AppShellContent() {
           ? workspaceIdOverride
           : selectedWorkspaceId || null;
       void window.electronAPI.browser
-        .setActiveWorkspace(targetWorkspaceId)
+        .setActiveWorkspace(targetWorkspaceId, "user")
         .then(() => window.electronAPI.browser.navigate(normalizedUrl))
         .catch(() => undefined);
     },
@@ -2045,16 +2104,6 @@ function AppShellContent() {
     : (visibleSpacePaneIds[visibleSpacePaneIds.length - 1] ?? null);
   const showOperationsDrawer =
     spaceMode && spaceVisibility.agent && operationsDrawerOpen;
-  const shouldUseSafeToastAnchor =
-    hasWorkspaces && (!spaceMode || visibleSpacePaneIds.includes("files"));
-  const anchoredToastStackClassName = shouldUseSafeToastAnchor
-    ? "pointer-events-none absolute bottom-4 left-0 z-20 flex max-w-full flex-col gap-3 sm:bottom-6"
-    : undefined;
-  const anchoredToastStackStyle = shouldUseSafeToastAnchor
-    ? {
-        width: FIXED_SAFE_TOAST_REGION_WIDTH_PX,
-      }
-    : undefined;
   const shouldShowAppUpdateReminder = Boolean(
     effectiveAppUpdateStatus &&
       (effectiveAppUpdateStatus.available ||
@@ -2194,16 +2243,12 @@ function AppShellContent() {
     [
       agentContent,
       browserPaneWidth,
+      fileExplorerFocusRequest,
       filesPaneWidth,
       flexSpacePaneId,
-      publishOpen,
-      isUtilityPaneResizing,
-      createWorkspacePanelOpen,
-      settingsDialogOpen,
       shouldSuspendBrowserNativeView,
       showOperationsDrawer,
       visibleSpacePaneIds,
-      workspaceSwitcherOpen,
     ],
   );
 
@@ -2267,26 +2312,27 @@ function AppShellContent() {
       return;
     }
 
-    const syncWidth = () => {
-      if (spaceVisibility.files && flexSpacePaneId !== "files") {
-        setFilesPaneWidth((current) => clampUtilityPaneWidth("files", current));
-      }
-      if (spaceVisibility.browser && flexSpacePaneId !== "browser") {
-        setBrowserPaneWidth((current) =>
-          clampUtilityPaneWidth("browser", current),
-        );
-      }
-    };
+    syncUtilityPaneWidths();
+    window.addEventListener("resize", syncUtilityPaneWidths);
 
-    syncWidth();
-    window.addEventListener("resize", syncWidth);
+    const host = utilityPaneHostRef.current;
+    const observer =
+      host && typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            syncUtilityPaneWidths();
+          })
+        : null;
+    if (observer && host) {
+      observer.observe(host);
+    }
+
     return () => {
-      window.removeEventListener("resize", syncWidth);
+      observer?.disconnect();
+      window.removeEventListener("resize", syncUtilityPaneWidths);
     };
   }, [
-    clampUtilityPaneWidth,
-    flexSpacePaneId,
-    spaceVisibility,
+    showOperationsDrawer,
+    syncUtilityPaneWidths,
     visibleSpacePaneIds.length,
   ]);
 
@@ -2380,8 +2426,6 @@ function AppShellContent() {
           onActivateNotification={(notificationId) => {
             void handleActivateNotification(notificationId);
           }}
-          className={anchoredToastStackClassName}
-          style={anchoredToastStackStyle}
         />
 
         {hasWorkspaces ? (
@@ -2444,10 +2488,40 @@ function AppShellContent() {
             <div className="relative flex h-full min-h-0 flex-col overflow-hidden">
               <div className="min-h-0 flex-1 overflow-hidden">
                 {spaceMode ? (
-                  <div className="relative flex h-full min-h-0 flex-col overflow-hidden">
+                  <div className="relative flex h-full min-h-0 min-w-0 overflow-hidden">
+                    <div className="mr-1.5 flex w-9 shrink-0 flex-col items-center gap-1.5 py-1">
+                      <button
+                        type="button"
+                        aria-label="Toggle files pane"
+                        aria-pressed={spaceVisibility.files}
+                        title="Files"
+                        onClick={() => toggleUtilityPaneVisibility("files")}
+                        className={`inline-flex size-8 items-center justify-center rounded-lg transition-colors ${
+                          spaceVisibility.files
+                            ? "bg-primary/12 text-primary"
+                            : "text-muted-foreground hover:bg-accent/36 hover:text-accent-foreground"
+                        }`}
+                      >
+                        <FileText size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Toggle browser pane"
+                        aria-pressed={spaceVisibility.browser}
+                        title="Browser"
+                        onClick={() => toggleUtilityPaneVisibility("browser")}
+                        className={`inline-flex size-8 items-center justify-center rounded-lg transition-colors ${
+                          spaceVisibility.browser
+                            ? "bg-primary/12 text-primary"
+                            : "text-muted-foreground hover:bg-accent/36 hover:text-accent-foreground"
+                        }`}
+                      >
+                        <Globe size={14} />
+                      </button>
+                    </div>
                     <div
                       ref={utilityPaneHostRef}
-                      className="min-h-0 flex-1 overflow-hidden"
+                      className="min-h-0 min-w-0 flex-1 overflow-hidden"
                     >
                       {spacePanes.length > 0 ? (
                         <div className="flex h-full min-h-0 min-w-0 items-stretch overflow-hidden">
@@ -2463,7 +2537,9 @@ function AppShellContent() {
                                   className={`relative min-h-0 min-w-0 overflow-hidden rounded-[var(--radius-xl)] ${pane.flex ? "flex-1" : "shrink-0"}`}
                                   style={
                                     pane.flex
-                                      ? undefined
+                                      ? {
+                                          minWidth: `${MIN_AGENT_CONTENT_WIDTH}px`,
+                                        }
                                       : { width: `${pane.width}px` }
                                   }
                                 >
