@@ -2127,6 +2127,9 @@ interface SessionRuntimeRecordPayload {
   lease_until: string | null;
   heartbeat_at: string | null;
   last_error: Record<string, unknown> | null;
+  last_turn_status: string | null;
+  last_turn_completed_at: string | null;
+  last_turn_stop_reason: string | null;
   created_at: string;
   updated_at: string;
 }

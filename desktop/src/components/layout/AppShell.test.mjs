@@ -47,8 +47,9 @@ test("app shell polls runtime notifications and renders the toast stack", async 
 
   assert.match(source, /window\.electronAPI\.workspace\.listNotifications\(\s*null\s*\)/);
   assert.match(source, /<NotificationToastStack[\s\S]*leadingToast=\{/);
-  assert.match(source, /<NotificationToastStack[\s\S]*notifications=\{toastNotifications\}/);
-  assert.match(source, /<NotificationToastStack[\s\S]*onCloseToast=\{\(notificationId\) => \{\s*void handleDismissNotification\(notificationId\);\s*\}\}/);
+  assert.match(source, /const effectiveToastNotifications = useMemo\(/);
+  assert.match(source, /<NotificationToastStack[\s\S]*notifications=\{effectiveToastNotifications\}/);
+  assert.match(source, /<NotificationToastStack[\s\S]*onCloseToast=\{\(notificationId\) => \{\s*void handleCloseDisplayedNotification\(notificationId\);\s*\}\}/);
   assert.doesNotMatch(source, /className=\{anchoredToastStackClassName\}/);
   assert.doesNotMatch(source, /style=\{anchoredToastStackStyle\}/);
   assert.match(source, /const runtimeNotificationById = useMemo\(/);
@@ -86,6 +87,17 @@ test("app shell exposes a dev-only app update preview hook", async () => {
   assert.match(source, /ready: \(\) => updateMode\("ready"\)/);
   assert.match(source, /clear: \(\) => updateMode\("off"\)/);
   assert.match(source, /buildDevAppUpdatePreviewStatus\(/);
+});
+
+test("app shell exposes a dev-only notification toast preview hook", async () => {
+  const source = await readFile(APP_SHELL_PATH, "utf8");
+
+  assert.match(source, /const DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX =\s*"dev-notification-toast-preview:";/);
+  assert.match(source, /function buildDevNotificationToastPreviewNotifications\(/);
+  assert.match(source, /window\.__holabossDevNotificationToastPreview = \{/);
+  assert.match(source, /stack: \(\) => showDevNotificationToastPreview\(\)/);
+  assert.match(source, /clear: \(\) => clearDevNotificationToastPreview\(\)/);
+  assert.match(source, /if \(isDevNotificationToastPreviewId\(notificationId\)\) \{/);
 });
 
 test("app shell uses the integrated title bar path for macOS and Windows", async () => {
@@ -160,6 +172,19 @@ test("app shell requests remote task proposal generation without a separate succ
   assert.match(source, /Suggestions are unavailable right now\./);
   assert.doesNotMatch(source, /Remote heartbeat accepted/);
   assert.doesNotMatch(source, /Pending cloud jobs/);
+});
+
+test("app shell tracks unread task proposals and badges the inbox control", async () => {
+  const source = await readFile(APP_SHELL_PATH, "utf8");
+
+  assert.match(source, /const TASK_PROPOSAL_SEEN_STORAGE_KEY = "holaboss-task-proposal-seen-v1";/);
+  assert.match(source, /const \[seenTaskProposalIdsByWorkspace, setSeenTaskProposalIdsByWorkspace\] =\s*useState<Record<string, string\[]>>\(loadSeenTaskProposalIdsByWorkspace\);/);
+  assert.match(source, /const unreadTaskProposalCount = useMemo\(\(\) => \{/);
+  assert.match(source, /const markTaskProposalsSeen = useCallback\(/);
+  assert.match(source, /if \(tab === "inbox" && selectedWorkspaceId\) \{\s*markTaskProposalsSeen\(selectedWorkspaceId, taskProposals\);\s*\}/);
+  assert.match(source, /unreadProposalCount=\{unreadTaskProposalCount\}/);
+  assert.match(source, /className="relative inline-flex h-8 w-8 items-center justify-center rounded-\[12px\] border border-border\/45 text-muted-foreground transition-all duration-200 hover:border-primary\/45 hover:text-primary active:scale-95"/);
+  assert.match(source, /unreadTaskProposalCount > 0 \? \(\s*<span className="absolute -right-0\.5 -top-0\.5 size-2\.5 rounded-full border-2 border-card bg-destructive" \/>\s*\) : null/);
 });
 
 test("app shell restores pane visibility without manual files and browser toggles", async () => {

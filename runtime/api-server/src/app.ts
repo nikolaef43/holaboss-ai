@@ -541,6 +541,18 @@ function runtimeStatePayload(record: SessionRuntimeStateRecord): Record<string, 
   };
 }
 
+function runtimeStateListItemPayload(params: {
+  record: SessionRuntimeStateRecord;
+  lastTurnResult?: TurnResultRecord | null;
+}): Record<string, unknown> {
+  return {
+    ...runtimeStatePayload(params.record),
+    last_turn_status: params.lastTurnResult?.status ?? null,
+    last_turn_completed_at: params.lastTurnResult?.completedAt ?? null,
+    last_turn_stop_reason: params.lastTurnResult?.stopReason ?? null,
+  };
+}
+
 function sessionMessagePayload(record: SessionMessageRecord, metadata?: Record<string, unknown>): Record<string, unknown> {
   return {
     id: record.id,
@@ -3882,7 +3894,18 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
     const params = request.params as { workspaceId: string };
     const items = store
       .listRuntimeStates(params.workspaceId)
-      .map((item: SessionRuntimeStateRecord) => runtimeStatePayload(item));
+      .map((item: SessionRuntimeStateRecord) =>
+        runtimeStateListItemPayload({
+          record: item,
+          lastTurnResult:
+            store.listTurnResults({
+              workspaceId: params.workspaceId,
+              sessionId: item.sessionId,
+              limit: 1,
+              offset: 0,
+            })[0] ?? null,
+        }),
+      );
     return { items, count: items.length };
   });
 
@@ -4206,13 +4229,22 @@ export function buildRuntimeApiServer(options: BuildRuntimeApiServerOptions = {}
         artifactsBySession.set(sessionId, [payload]);
       }
     }
-    const items = runtimeStates.map((row) => ({
-      session_id: row.sessionId,
-      status: row.status,
-      created_at: row.createdAt,
-      updated_at: row.updatedAt,
-      artifacts: artifactsBySession.get(row.sessionId) ?? [],
-    }));
+    const items = runtimeStates.map((row) => {
+      const lastTurnResult =
+        store.listTurnResults({
+          workspaceId: params.workspaceId,
+          sessionId: row.sessionId,
+          limit: 1,
+          offset: 0,
+        })[0] ?? null;
+      return {
+        ...runtimeStateListItemPayload({
+          record: row,
+          lastTurnResult,
+        }),
+        artifacts: artifactsBySession.get(row.sessionId) ?? [],
+      };
+    });
     return { items, count: items.length };
   });
 

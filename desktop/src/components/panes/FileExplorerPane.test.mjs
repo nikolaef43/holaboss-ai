@@ -47,6 +47,18 @@ test("file explorer opens folders on double click instead of single click", asyn
   assert.match(source, /double-click to open folder/);
 });
 
+test("file explorer keeps drag-to-attach without using a grab cursor", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.match(source, /const rowClassName = `group mb-0\.5 w-full rounded-md px-2 py-1\.5 text-left transition-colors/);
+  assert.match(source, /\$\{isRenaming \? "cursor-default" : "cursor-pointer"\}/);
+  assert.match(source, /className="w-full cursor-pointer text-left"/);
+  assert.match(source, /draggable=\{!entry\.isDirectory\}/);
+  assert.match(source, /event\.dataTransfer\.effectAllowed = "copy";/);
+  assert.doesNotMatch(source, /cursor-grab/);
+  assert.doesNotMatch(source, /cursor-grabbing/);
+});
+
 test("file explorer home opens the selected workspace root when available", async () => {
   const source = await readFile(sourcePath, "utf8");
 

@@ -25,6 +25,10 @@ import { useWorkspaceSelection } from "@/lib/workspaceSelection";
 
 const HOME_URL = "https://www.google.com";
 const DEFAULT_BROWSER_SPACE: BrowserSpaceId = "user";
+const EXPLICIT_SCHEME_PATTERN = /^[a-zA-Z][a-zA-Z\d+\-.]*:/;
+const LOCALHOST_PATTERN = /^localhost(?::\d+)?(?:[/?#]|$)/i;
+const IPV4_HOST_PATTERN = /^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#]|$)/;
+const IPV6_HOST_PATTERN = /^\[[0-9a-fA-F:]+\](?::\d+)?(?:[/?#]|$)/;
 
 const EMPTY_BROWSER_STATE: BrowserStatePayload = {
   id: "",
@@ -53,8 +57,20 @@ function normalizeUrl(rawInput: string) {
     return HOME_URL;
   }
 
-  if (/^https?:\/\//i.test(trimmed)) {
+  if (EXPLICIT_SCHEME_PATTERN.test(trimmed)) {
     return trimmed;
+  }
+
+  if (trimmed.startsWith("//")) {
+    return `https:${trimmed}`;
+  }
+
+  if (
+    LOCALHOST_PATTERN.test(trimmed) ||
+    IPV4_HOST_PATTERN.test(trimmed) ||
+    IPV6_HOST_PATTERN.test(trimmed)
+  ) {
+    return `http://${trimmed}`;
   }
 
   if (trimmed.includes(".")) {

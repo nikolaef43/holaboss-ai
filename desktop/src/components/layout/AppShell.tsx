@@ -57,8 +57,11 @@ import {
 
 const THEME_STORAGE_KEY = "holaboss-theme-v1";
 const DEV_APP_UPDATE_PREVIEW_STORAGE_KEY = "holaboss-dev-app-update-preview-v1";
+const DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX =
+  "dev-notification-toast-preview:";
 const OPERATIONS_DRAWER_OPEN_STORAGE_KEY = "holaboss-operations-drawer-open-v1";
 const OPERATIONS_DRAWER_TAB_STORAGE_KEY = "holaboss-operations-drawer-tab-v1";
+const TASK_PROPOSAL_SEEN_STORAGE_KEY = "holaboss-task-proposal-seen-v1";
 const FILES_PANE_WIDTH_STORAGE_KEY = "holaboss-files-pane-width-v1";
 const BROWSER_PANE_WIDTH_STORAGE_KEY = "holaboss-browser-pane-width-v1";
 const SPACE_VISIBILITY_STORAGE_KEY = "holaboss-space-visibility-v1";
@@ -91,6 +94,7 @@ const APP_UPDATE_CHANGELOG_BASE_URL =
 const DEFAULT_NOTIFICATION_TOAST_DURATION_MS = 7_000;
 const CRITICAL_NOTIFICATION_TOAST_DURATION_MS = 12_000;
 const DEFAULT_PROACTIVE_HEARTBEAT_CRON = "0 9 * * *";
+const MAX_SEEN_TASK_PROPOSAL_IDS_PER_WORKSPACE = 200;
 
 type SpaceComponentId = "agent" | "files" | "browser";
 type UtilityPaneId = "files" | "browser";
@@ -127,6 +131,10 @@ declare global {
     __holabossDevUpdatePreview?: {
       downloading: () => void;
       ready: () => void;
+      clear: () => void;
+    };
+    __holabossDevNotificationToastPreview?: {
+      stack: () => void;
       clear: () => void;
     };
   }
@@ -201,6 +209,87 @@ function notificationToastDurationMs(
   return notification.priority === "critical"
     ? CRITICAL_NOTIFICATION_TOAST_DURATION_MS
     : DEFAULT_NOTIFICATION_TOAST_DURATION_MS;
+}
+
+function isDevNotificationToastPreviewId(notificationId: string): boolean {
+  return notificationId.startsWith(DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX);
+}
+
+function buildDevNotificationToastPreviewNotifications(
+  workspaceId: string | null,
+): RuntimeNotificationRecordPayload[] {
+  const normalizedWorkspaceId = workspaceId?.trim() || "dev-preview-workspace";
+  const now = Date.now();
+  return [
+    {
+      id: `${DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX}1`,
+      workspace_id: normalizedWorkspaceId,
+      cronjob_id: null,
+      source_type: "dev_preview",
+      source_label: "Preview",
+      title: "Task proposal ready",
+      message: "This is a collapsed preview stack. Hover it to fan the toasts out.",
+      level: "info",
+      priority: "normal",
+      state: "unread",
+      metadata: {},
+      read_at: null,
+      dismissed_at: null,
+      created_at: new Date(now - 45_000).toISOString(),
+      updated_at: new Date(now - 45_000).toISOString(),
+    },
+    {
+      id: `${DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX}2`,
+      workspace_id: normalizedWorkspaceId,
+      cronjob_id: null,
+      source_type: "dev_preview",
+      source_label: "Preview",
+      title: "Build completed",
+      message: "A success toast helps show the stacked depth and color treatment.",
+      level: "success",
+      priority: "low",
+      state: "unread",
+      metadata: {},
+      read_at: null,
+      dismissed_at: null,
+      created_at: new Date(now - 90_000).toISOString(),
+      updated_at: new Date(now - 90_000).toISOString(),
+    },
+    {
+      id: `${DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX}3`,
+      workspace_id: normalizedWorkspaceId,
+      cronjob_id: null,
+      source_type: "dev_preview",
+      source_label: "Preview",
+      title: "Workflow waiting on input",
+      message: "Use this preview hook whenever you want to inspect the stacked toast layout.",
+      level: "warning",
+      priority: "high",
+      state: "unread",
+      metadata: {},
+      read_at: null,
+      dismissed_at: null,
+      created_at: new Date(now - 135_000).toISOString(),
+      updated_at: new Date(now - 135_000).toISOString(),
+    },
+    {
+      id: `${DEV_NOTIFICATION_TOAST_PREVIEW_ID_PREFIX}4`,
+      workspace_id: normalizedWorkspaceId,
+      cronjob_id: null,
+      source_type: "dev_preview",
+      source_label: "Preview",
+      title: "Run failed",
+      message: "The fourth toast makes the overlap obvious without needing real notification traffic.",
+      level: "error",
+      priority: "critical",
+      state: "unread",
+      metadata: {},
+      read_at: null,
+      dismissed_at: null,
+      created_at: new Date(now - 180_000).toISOString(),
+      updated_at: new Date(now - 180_000).toISOString(),
+    },
+  ];
 }
 
 function appUpdateChangelogUrl(
@@ -334,6 +423,44 @@ function loadOperationsDrawerTab(): OperationsDrawerTab {
   }
 
   return "inbox";
+}
+
+function loadSeenTaskProposalIdsByWorkspace(): Record<string, string[]> {
+  try {
+    const raw = localStorage.getItem(TASK_PROPOSAL_SEEN_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    const next: Record<string, string[]> = {};
+    for (const [workspaceId, proposalIds] of Object.entries(parsed)) {
+      const normalizedWorkspaceId = workspaceId.trim();
+      if (!normalizedWorkspaceId || !Array.isArray(proposalIds)) {
+        continue;
+      }
+      const cleaned = Array.from(
+        new Set(
+          proposalIds
+            .filter((value): value is string => typeof value === "string")
+            .map((value) => value.trim())
+            .filter(Boolean),
+        ),
+      ).slice(-MAX_SEEN_TASK_PROPOSAL_IDS_PER_WORKSPACE);
+      if (cleaned.length > 0) {
+        next[normalizedWorkspaceId] = cleaned;
+      }
+    }
+    return next;
+  } catch {
+    // ignore invalid persisted proposal state
+  }
+
+  return {};
 }
 
 function loadTheme(): AppTheme {
@@ -737,6 +864,8 @@ function AppShellContent() {
   const [taskProposals, setTaskProposals] = useState<
     TaskProposalRecordPayload[]
   >([]);
+  const [seenTaskProposalIdsByWorkspace, setSeenTaskProposalIdsByWorkspace] =
+    useState<Record<string, string[]>>(loadSeenTaskProposalIdsByWorkspace);
   const [isLoadingTaskProposals, setIsLoadingTaskProposals] = useState(false);
   const [isTriggeringTaskProposal, setIsTriggeringTaskProposal] =
     useState(false);
@@ -779,6 +908,8 @@ function AppShellContent() {
   const [toastNotifications, setToastNotifications] = useState<
     RuntimeNotificationRecordPayload[]
   >([]);
+  const [devNotificationToastPreview, setDevNotificationToastPreview] =
+    useState<RuntimeNotificationRecordPayload[]>([]);
   const utilityPaneHostRef = useRef<HTMLDivElement | null>(null);
   const utilityPaneResizeStateRef = useRef<UtilityPaneResizeState | null>(null);
   const filesPaneWidthRef = useRef(filesPaneWidth);
@@ -837,9 +968,77 @@ function AppShellContent() {
       ) ?? appUpdateStatus,
     [appUpdateStatus, devAppUpdatePreviewMode],
   );
+  const effectiveToastNotifications = useMemo(
+    () =>
+      devNotificationToastPreview.length > 0
+        ? devNotificationToastPreview
+        : toastNotifications,
+    [devNotificationToastPreview, toastNotifications],
+  );
   const runtimeNotificationById = useMemo(
     () => new Map(notifications.map((notification) => [notification.id, notification])),
     [notifications],
+  );
+  const unreadTaskProposalCount = useMemo(() => {
+    if (!selectedWorkspaceId || taskProposals.length === 0) {
+      return 0;
+    }
+    const seenProposalIds = new Set(
+      seenTaskProposalIdsByWorkspace[selectedWorkspaceId] ?? [],
+    );
+    return taskProposals.reduce((count, proposal) => {
+      const proposalId = proposal.proposal_id.trim();
+      if (!proposalId || seenProposalIds.has(proposalId)) {
+        return count;
+      }
+      return count + 1;
+    }, 0);
+  }, [seenTaskProposalIdsByWorkspace, selectedWorkspaceId, taskProposals]);
+
+  const markTaskProposalsSeen = useCallback(
+    (
+      workspaceId: string | null | undefined,
+      proposals: TaskProposalRecordPayload[],
+    ) => {
+      const normalizedWorkspaceId = workspaceId?.trim() || "";
+      if (!normalizedWorkspaceId || proposals.length === 0) {
+        return;
+      }
+
+      const proposalIds = Array.from(
+        new Set(
+          proposals
+            .map((proposal) => proposal.proposal_id.trim())
+            .filter(Boolean),
+        ),
+      );
+      if (proposalIds.length === 0) {
+        return;
+      }
+
+      setSeenTaskProposalIdsByWorkspace((current) => {
+        const existing = current[normalizedWorkspaceId] ?? [];
+        const nextIds = [...existing];
+        let changed = false;
+        for (const proposalId of proposalIds) {
+          if (nextIds.includes(proposalId)) {
+            continue;
+          }
+          nextIds.push(proposalId);
+          changed = true;
+        }
+        if (!changed) {
+          return current;
+        }
+        return {
+          ...current,
+          [normalizedWorkspaceId]: nextIds.slice(
+            -MAX_SEEN_TASK_PROPOSAL_IDS_PER_WORKSPACE,
+          ),
+        };
+      });
+    },
+    [],
   );
 
   const clampUtilityPaneWidth = useCallback(
@@ -1052,6 +1251,31 @@ function AppShellContent() {
       delete window.__holabossDevUpdatePreview;
     };
   }, []);
+
+  const showDevNotificationToastPreview = useCallback(() => {
+    setDevNotificationToastPreview(
+      buildDevNotificationToastPreviewNotifications(selectedWorkspaceId),
+    );
+  }, [selectedWorkspaceId]);
+
+  const clearDevNotificationToastPreview = useCallback(() => {
+    setDevNotificationToastPreview([]);
+  }, []);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) {
+      return;
+    }
+
+    window.__holabossDevNotificationToastPreview = {
+      stack: () => showDevNotificationToastPreview(),
+      clear: () => clearDevNotificationToastPreview(),
+    };
+
+    return () => {
+      delete window.__holabossDevNotificationToastPreview;
+    };
+  }, [clearDevNotificationToastPreview, showDevNotificationToastPreview]);
 
   useEffect(() => {
     if (!window.electronAPI) {
@@ -1303,6 +1527,12 @@ function AppShellContent() {
 
   const handleDismissNotification = useCallback(
     async (notificationId: string) => {
+      if (isDevNotificationToastPreviewId(notificationId)) {
+        setDevNotificationToastPreview((current) =>
+          current.filter((item) => item.id !== notificationId),
+        );
+        return;
+      }
       if (!window.electronAPI) {
         return;
       }
@@ -1326,6 +1556,32 @@ function AppShellContent() {
       runtimeNotificationById,
       refreshNotifications,
     ],
+  );
+
+  const handleActivateDisplayedNotification = useCallback(
+    async (notificationId: string) => {
+      if (isDevNotificationToastPreviewId(notificationId)) {
+        setDevNotificationToastPreview((current) =>
+          current.filter((item) => item.id !== notificationId),
+        );
+        return;
+      }
+      await handleActivateNotification(notificationId);
+    },
+    [handleActivateNotification],
+  );
+
+  const handleCloseDisplayedNotification = useCallback(
+    async (notificationId: string) => {
+      if (isDevNotificationToastPreviewId(notificationId)) {
+        setDevNotificationToastPreview((current) =>
+          current.filter((item) => item.id !== notificationId),
+        );
+        return;
+      }
+      await handleDismissNotification(notificationId);
+    },
+    [handleDismissNotification],
   );
 
   useEffect(() => {
@@ -1424,6 +1680,13 @@ function AppShellContent() {
       activeOperationsTab,
     );
   }, [activeOperationsTab]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      TASK_PROPOSAL_SEEN_STORAGE_KEY,
+      JSON.stringify(seenTaskProposalIdsByWorkspace),
+    );
+  }, [seenTaskProposalIdsByWorkspace]);
 
   useEffect(() => {
     localStorage.setItem(FILES_PANE_WIDTH_STORAGE_KEY, String(filesPaneWidth));
@@ -1801,6 +2064,24 @@ function AppShellContent() {
   ]);
 
   useEffect(() => {
+    if (
+      !operationsDrawerOpen ||
+      activeOperationsTab !== "inbox" ||
+      !selectedWorkspaceId ||
+      taskProposals.length === 0
+    ) {
+      return;
+    }
+    markTaskProposalsSeen(selectedWorkspaceId, taskProposals);
+  }, [
+    activeOperationsTab,
+    markTaskProposalsSeen,
+    operationsDrawerOpen,
+    selectedWorkspaceId,
+    taskProposals,
+  ]);
+
+  useEffect(() => {
     if (!selectedWorkspaceId || !selectedWorkspace) {
       setProactiveStatus(null);
       setIsLoadingProactiveStatus(false);
@@ -1908,6 +2189,9 @@ function AppShellContent() {
   const openOperationsDrawerTab = (tab: OperationsDrawerTab) => {
     setActiveOperationsTab(tab);
     setOperationsDrawerOpen(true);
+    if (tab === "inbox" && selectedWorkspaceId) {
+      markTaskProposalsSeen(selectedWorkspaceId, taskProposals);
+    }
   };
 
   const installedAppIds = useMemo(
@@ -2422,12 +2706,12 @@ function AppShellContent() {
               />
             ) : null
           }
-          notifications={toastNotifications}
+          notifications={effectiveToastNotifications}
           onCloseToast={(notificationId) => {
-            void handleDismissNotification(notificationId);
+            void handleCloseDisplayedNotification(notificationId);
           }}
           onActivateNotification={(notificationId) => {
-            void handleActivateNotification(notificationId);
+            void handleActivateDisplayedNotification(notificationId);
           }}
         />
 
@@ -2622,10 +2906,17 @@ function AppShellContent() {
                       <button
                         type="button"
                         onClick={() => openOperationsDrawerTab("inbox")}
-                        aria-label="Open inbox panel"
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-[12px] border border-border/45 text-muted-foreground transition-all duration-200 hover:border-primary/45 hover:text-primary active:scale-95"
+                        aria-label={
+                          unreadTaskProposalCount > 0
+                            ? `Open inbox panel with ${unreadTaskProposalCount} unread proposal${unreadTaskProposalCount === 1 ? "" : "s"}`
+                            : "Open inbox panel"
+                        }
+                        className="relative inline-flex h-8 w-8 items-center justify-center rounded-[12px] border border-border/45 text-muted-foreground transition-all duration-200 hover:border-primary/45 hover:text-primary active:scale-95"
                       >
                         <InboxIcon size={13} />
+                        {unreadTaskProposalCount > 0 ? (
+                          <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-card bg-destructive" />
+                        ) : null}
                       </button>
                       <button
                         type="button"
@@ -2653,8 +2944,9 @@ function AppShellContent() {
               <div className="min-h-0 min-w-0 overflow-hidden transition-all duration-300 ease-out">
                 <OperationsDrawer
                   activeTab={activeOperationsTab}
-                  onTabChange={setActiveOperationsTab}
+                  onTabChange={openOperationsDrawerTab}
                   proposals={taskProposals}
+                  unreadProposalCount={unreadTaskProposalCount}
                   proactiveStatus={proactiveStatus}
                   isLoadingProactiveStatus={isLoadingProactiveStatus}
                   proactiveWorkspaceEnabled={proactiveWorkspaceEnabled}

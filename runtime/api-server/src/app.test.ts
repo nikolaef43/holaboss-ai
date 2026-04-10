@@ -1459,6 +1459,11 @@ test("runtime states and history endpoints read TS state store", async () => {
     sourceProposalId: "proposal-1",
     createdBy: "workspace_user"
   });
+  store.ensureRuntimeState({
+    workspaceId: workspace.id,
+    sessionId: "session-main",
+    status: "IDLE",
+  });
 
   const sessions = await app.inject({
     method: "GET",
@@ -1498,7 +1503,12 @@ test("runtime states and history endpoints read TS state store", async () => {
   assert.equal(proposalSession.kind, "task_proposal");
   assert.equal(proposalSession.parent_session_id, "session-main");
   assert.equal(states.statusCode, 200);
-  assert.deepEqual(states.json().items, []);
+  assert.equal(states.json().count, 1);
+  assert.equal(states.json().items[0].session_id, "session-main");
+  assert.equal(states.json().items[0].status, "IDLE");
+  assert.equal(states.json().items[0].last_turn_status, "completed");
+  assert.equal(states.json().items[0].last_turn_completed_at, "2026-01-01T00:00:05.000Z");
+  assert.equal(states.json().items[0].last_turn_stop_reason, "ok");
   assert.equal(history.statusCode, 200);
   assert.equal(history.json().source, "sandbox_local_storage");
   assert.equal(history.json().harness, "pi");

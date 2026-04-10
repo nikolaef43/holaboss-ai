@@ -29,3 +29,29 @@ test("browser pane exposes a single inline browser-space switcher", async () => 
   assert.doesNotMatch(source, /visibleBrowserCount/);
   assert.doesNotMatch(source, /aria-label="Downloads"/);
 });
+
+test("browser pane preserves explicit URL schemes and supports localhost-style input", async () => {
+  const source = await readFile(sourcePath, "utf8");
+
+  assert.equal(
+    source.includes('const EXPLICIT_SCHEME_PATTERN = /^[a-zA-Z][a-zA-Z\\d+\\-.]*:/;'),
+    true,
+  );
+  assert.equal(
+    source.includes("if (EXPLICIT_SCHEME_PATTERN.test(trimmed)) {\n    return trimmed;\n  }"),
+    true,
+  );
+  assert.equal(
+    source.includes('const LOCALHOST_PATTERN = /^localhost(?::\\d+)?(?:[/?#]|$)/i;'),
+    true,
+  );
+  assert.equal(
+    source.includes('const IPV4_HOST_PATTERN = /^(?:\\d{1,3}\\.){3}\\d{1,3}(?::\\d+)?(?:[/?#]|$)/;'),
+    true,
+  );
+  assert.equal(
+    source.includes('const IPV6_HOST_PATTERN = /^\\[[0-9a-fA-F:]+\\](?::\\d+)?(?:[/?#]|$)/;'),
+    true,
+  );
+  assert.equal(source.includes("return `http://${trimmed}`;"), true);
+});

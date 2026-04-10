@@ -1502,13 +1502,7 @@ export function FileExplorerPane({
                       selected
                         ? "bg-primary/10 text-primary"
                         : "text-foreground/80 hover:bg-accent hover:text-accent-foreground"
-                    } ${
-                      isRenaming
-                        ? "cursor-default"
-                        : entry.isDirectory
-                          ? "cursor-pointer"
-                          : "cursor-grab active:cursor-grabbing"
-                    }`;
+                    } ${isRenaming ? "cursor-default" : "cursor-pointer"}`;
                     const nameField = isRenaming ? (
                       <input
                         ref={renameInputRef}
@@ -1635,7 +1629,7 @@ export function FileExplorerPane({
                             dragPreviewRef.current?.remove();
                             dragPreviewRef.current = null;
                           }}
-                          className="w-full text-left"
+                          className="w-full cursor-pointer text-left"
                           title={
                             entry.isDirectory
                               ? `${entry.name} — double-click to open folder`
