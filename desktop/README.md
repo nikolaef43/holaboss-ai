@@ -210,6 +210,15 @@ Release channel policy:
 - desktop-shippable stable releases stay under `holaboss-*`
 - the in-app desktop update notice is intended to track desktop-shippable releases, not runtime-only bundle releases
 
+Desktop release versioning:
+- use stable semver in `YYYY.MDD.R` format
+- `YYYY` = year, `MDD` = month without a leading zero plus a two-digit day, `R` = release number for that date
+- examples: `2026.410.1`, `2026.410.2`, `2026.1113.1`
+- do not zero-pad the month in the middle segment; `2026.0410.1` is not valid semver
+- the desktop packager derives the app update version from the trailing `X.Y.Z` suffix in `release_tag`, so tags should end with the same `YYYY.MDD.R` value
+- to print a version for today, run `npm --prefix desktop run release:version`
+- to print the second release for a specific day, run `npm --prefix desktop run release:version -- 2 --date 2026-04-10`
+
 The desktop release workflow requires these repository secrets and fails fast when any of them are missing:
 
 - `MAC_CERTIFICATE`: base64-encoded `Developer ID Application` `.p12`
