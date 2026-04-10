@@ -53,6 +53,13 @@ interface FileSystemMutationPayload {
   absolutePath: string;
 }
 
+interface DiagnosticsExportPayload {
+  bundlePath: string;
+  fileName: string;
+  archiveSizeBytes: number;
+  includedFiles: string[];
+}
+
 interface BrowserBoundsPayload {
   x: number;
   y: number;
@@ -922,6 +929,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.on("fs:bookmarks", wrapped);
       return () => ipcRenderer.removeListener("fs:bookmarks", wrapped);
     }
+  },
+  diagnostics: {
+    exportBundle: () =>
+      ipcRenderer.invoke("diagnostics:exportBundle") as Promise<DiagnosticsExportPayload>,
   },
   runtime: {
     getStatus: () => ipcRenderer.invoke("runtime:getStatus") as Promise<RuntimeStatusPayload>,

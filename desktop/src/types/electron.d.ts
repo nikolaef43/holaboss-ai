@@ -54,6 +54,13 @@ declare global {
     absolutePath: string;
   }
 
+  interface DiagnosticsExportPayload {
+    bundlePath: string;
+    fileName: string;
+    archiveSizeBytes: number;
+    includedFiles: string[];
+  }
+
   interface BrowserBoundsPayload {
     x: number;
     y: number;
@@ -1112,6 +1119,9 @@ declare global {
       addBookmark: (targetPath: string, label?: string, workspaceId?: string | null) => Promise<FileBookmarkPayload[]>;
       removeBookmark: (bookmarkId: string) => Promise<FileBookmarkPayload[]>;
       onBookmarksChange: (listener: (bookmarks: FileBookmarkPayload[]) => void) => () => void;
+    };
+    diagnostics: {
+      exportBundle: () => Promise<DiagnosticsExportPayload>;
     };
     runtime: {
       getStatus: () => Promise<RuntimeStatusPayload>;

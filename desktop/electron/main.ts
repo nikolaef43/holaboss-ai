@@ -2634,6 +2634,40 @@ function runtimeWorkspaceRoot() {
   return path.join(runtimeSandboxRoot(), "workspace");
 }
 
+function diagnosticsBundleFileName(date = new Date()) {
+  const timestamp = date
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "Z")
+    .replace(/:/g, "-");
+  return `holaboss-diagnostics-${timestamp}.zip`;
+}
+
+async function exportDesktopDiagnosticsBundle() {
+  const downloadsDir = app.getPath("downloads");
+  const bundlePath = path.join(downloadsDir, diagnosticsBundleFileName());
+  const { exportDiagnosticsBundle } = await import("./diagnostics-bundle.js");
+  const result = await exportDiagnosticsBundle({
+    bundlePath,
+    runtimeLogPath: runtimeLogsPath(),
+    runtimeDbPath: runtimeDatabasePath(),
+    runtimeConfigPath: runtimeConfigPath(),
+    summary: {
+      exported_at: utcNowIso(),
+      app_version: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch,
+      versions: {
+        chrome: process.versions.chrome,
+        electron: process.versions.electron,
+        node: process.versions.node,
+      },
+      runtime_status: runtimeStatus,
+    },
+  });
+  shell.showItemInFolder(result.bundlePath);
+  return result;
+}
+
 function processIsAlive(pid: number) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
@@ -15666,6 +15700,9 @@ app.whenReady().then(async () => {
         },
       });
     },
+  );
+  handleTrustedIpc("diagnostics:exportBundle", ["main"], async () =>
+    exportDesktopDiagnosticsBundle(),
   );
   ipcMain.handle(
     "browser:setActiveWorkspace",
