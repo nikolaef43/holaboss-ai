@@ -171,6 +171,7 @@ interface RuntimeConfigPayload {
   modelProxyBaseUrl: string | null;
   defaultModel: string | null;
   defaultBackgroundModel: string | null;
+  defaultEmbeddingModel: string | null;
   defaultImageModel: string | null;
   controlPlaneBaseUrl: string | null;
   catalogVersion: string | null;
@@ -198,6 +199,7 @@ interface RuntimeConfigUpdatePayload {
   modelProxyBaseUrl?: string | null;
   defaultModel?: string | null;
   defaultBackgroundModel?: string | null;
+  defaultEmbeddingModel?: string | null;
   defaultImageModel?: string | null;
   controlPlaneBaseUrl?: string | null;
 }
@@ -309,6 +311,7 @@ interface TaskProposalRecordPayload {
   task_name: string;
   task_prompt: string;
   task_generation_rationale: string;
+  proposal_source: "proactive" | "evolve";
   created_at: string;
   state: string;
   source_event_ids: string[];
