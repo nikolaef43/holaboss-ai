@@ -47,6 +47,7 @@ holaOS is the agent environment for long-horizon work. It gives agents a structu
 - [Documentation](#documentation)
 - [Manual Install](#manual-install)
     - [One-Line Agent Setup](#one-line-agent-setup)
+- [Contributing](#contributing)
 - [OSS Release Notes](#oss-release-notes)
 
 ## Quick Start
@@ -174,6 +175,17 @@ npm run desktop:prepare-runtime
 Use the local path when you are actively changing runtime code. Use the published bundle when you want to verify the desktop against a known release artifact.
 
 Use `One-Line Install` when you want the fastest path to a working local desktop environment. Use `Manual Install` when you need to inspect or control each setup step yourself.
+
+## Contributing
+
+Contributions are welcome. For the full contribution workflow, review [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The short version:
+
+- open an issue first for large or workflow-shaping changes
+- keep PRs narrow and explain the user-visible behavior change
+- update docs when setup, runtime behavior, or public workflows change
+- run `npm run desktop:typecheck` and `npm run runtime:test` before opening a PR
 
 ## OSS Release Notes
 
