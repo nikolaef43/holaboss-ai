@@ -182,6 +182,8 @@ Use `One-Line Install` when you want the fastest path to a working local desktop
 
 Contributions are welcome. For the full contribution workflow, review [CONTRIBUTING.md](CONTRIBUTING.md).
 
+Before opening a PR, also review the docs section on [Build on holaOS](https://www.holaboss.ai/docs/build-on-holaos/runtime-apis), especially [Local Setup](https://www.holaboss.ai/docs/build-on-holaos/developer-guide/local-setup), [Runtime APIs](https://www.holaboss.ai/docs/build-on-holaos/runtime-apis), and [Independent Deploy](https://www.holaboss.ai/docs/build-on-holaos/independent-deploy). That is the current source of truth for the local developer workflow.
+
 The short version:
 
 - open an issue first for large or workflow-shaping changes
