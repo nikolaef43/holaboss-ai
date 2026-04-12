@@ -98,7 +98,7 @@ All deeper technical and product documentation lives at **[holaboss.ai/docs](htt
 | [Build Your First App](https://www.holaboss.ai/docs/app-development/applications/first-app) | Building workspace apps on top of holaOS |
 | [Runtime APIs](https://www.holaboss.ai/docs/build-on-holaos/runtime-apis) | The runtime operational surface for workspaces, runs, and app lifecycle |
 | [Independent Deploy](https://www.holaboss.ai/docs/build-on-holaos/independent-deploy) | Running the portable runtime without the desktop app |
-| [Local Setup](https://www.holaboss.ai/docs/build-on-holaos/developer-guide/local-setup) | The local developer path for desktop and runtime validation |
+| [Start Developing](https://www.holaboss.ai/docs/build-on-holaos/start-developing/) | The local developer path for desktop and runtime validation |
 | [Troubleshooting](https://www.holaboss.ai/docs/build-on-holaos/developer-guide/troubleshooting) | The common local runtime and desktop failure modes |
 | [Workspace Experience](https://www.holaboss.ai/docs/desktop/workspace-experience) | The desktop workspace surface built on top of holaOS |
 | [Model Configuration](https://www.holaboss.ai/docs/desktop/model-configuration) | Providers, defaults, config precedence, and runtime model selection |
@@ -180,16 +180,7 @@ Use `One-Line Install` when you want the fastest path to a working local desktop
 
 ## Contributing
 
-Contributions are welcome. For the full contribution workflow, review [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Before opening a PR, also review the docs section on [Build on holaOS](https://www.holaboss.ai/docs/build-on-holaos/runtime-apis), especially [Local Setup](https://www.holaboss.ai/docs/build-on-holaos/developer-guide/local-setup), [Runtime APIs](https://www.holaboss.ai/docs/build-on-holaos/runtime-apis), and [Independent Deploy](https://www.holaboss.ai/docs/build-on-holaos/independent-deploy). That is the current source of truth for the local developer workflow.
-
-The short version:
-
-- open an issue first for large or workflow-shaping changes
-- keep PRs narrow and explain the user-visible behavior change
-- update docs when setup, runtime behavior, or public workflows change
-- run `npm run desktop:typecheck` and `npm run runtime:test` before opening a PR
+To learn more about how to contribute and how the system is structured, review [Contributing](https://www.holaboss.ai/docs/build-on-holaos/start-developing/contributing). It is the canonical page for the contributor workflow and the build-on-holaOS development path.
 
 ## OSS Release Notes
 
