@@ -218,9 +218,10 @@ jobs:
           SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           SENTRY_PROJECT: holaboss-desktop
         run: |
-          npx @sentry/cli releases files "${{ env.RELEASE_TAG }}" \
-            upload-sourcemaps out/dist out/dist-electron \
-            --url-prefix "~/"
+          npx @sentry/cli sourcemaps upload \
+            --release "${{ env.RELEASE_TAG }}" \
+            --url-prefix "~/" \
+            out/dist out/dist-electron
 
       - name: Validate signed macOS app bundle
         working-directory: desktop
